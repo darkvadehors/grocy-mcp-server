@@ -151,7 +151,10 @@ class GrocyClient:
         if entity not in self._CREATABLE:
             raise ValueError(f"création non autorisée : {entity}")
         result = await self._request("POST", f"/api/objects/{entity}", body=data)
-        return _int_id(result["created_object_id"])
+        created = result.get("created_object_id") if isinstance(result, dict) else None
+        if isinstance(created, str) and created.isdigit():  # Grocy renvoie l'identifiant en texte (PDO lastInsertId)
+            created = int(created)
+        return _int_id(created)
 
     # --- lectures --------------------------------------------------------------------------------
     async def products(self) -> list[dict]:

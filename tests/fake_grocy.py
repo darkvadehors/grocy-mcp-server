@@ -209,7 +209,8 @@ class FakeGrocy:
         if not user.can("MASTER_DATA_EDIT"):
             return _err(403, "Permission missing: MASTER_DATA_EDIT")
         new_id, error = self._insert(entity, body)
-        return error or httpx2.Response(200, json={"created_object_id": new_id})
+        # Grocy 4.7.1 renvoie lastInsertId() de PDO : une chaîne, pas un nombre
+        return error or httpx2.Response(200, json={"created_object_id": str(new_id)})
 
     def _external_lookup(self, user, request, body, code):
         if not user.can("MASTER_DATA_EDIT"):
