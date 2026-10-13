@@ -21,6 +21,8 @@ NUTRIENTS = {
 }
 CIQUAL_PATH = Path(__file__).parent / "data" / "ciqual-2020.json"
 MIN_UNIT_GRAMS, MAX_UNIT_GRAMS = 1, 50_000
+MAX_KCAL = 905  # huiles : 899 à 901 kcal pour 100 g dans Ciqual
+ROUNDING = 1.0  # g
 
 # Besoins de référence (EFSA, activité modérée NAP 1,6, arrondis) ; protéines : 0,83 g/kg × 70 kg (H) ou 60 kg (F)
 _KCAL = {"H": ((18, 2700), (30, 2500), (60, 2300), (70, 2100)), "F": ((18, 2100), (30, 2000), (60, 1900), (70, 1800))}
@@ -107,7 +109,7 @@ class CiqualIndex:
                 food,
             )
             for food, words in zip(self._foods, self._words, strict=True)
-            if words and all(any(w.startswith(q) for w in words) for q in wanted)
+            if words and "kcal" in food and all(any(w.startswith(q) for w in words) for q in wanted)
         ]
         return [t[-1] for t in sorted(found, key=lambda t: t[:4])[:limit]]
 
@@ -118,13 +120,14 @@ def check_values(values: dict) -> str | None:
     for key, value in clean.items():
         if not isinstance(value, int | float) or isinstance(value, bool) or value != value or value < 0:
             return f"{key} : valeur invalide"
-        if key == "kcal" and value > 900:
-            return "énergie supérieure à 900 kcal pour 100 g"
+        if key == "kcal" and value > MAX_KCAL:
+            return f"énergie supérieure à {MAX_KCAL} kcal pour 100 g"
         if key != "kcal" and value > 100:
             return f"{key} supérieur à 100 g pour 100 g"
-    if clean.get("sucres", 0) > clean.get("glucides", float("inf")):
+    # tolérance d'arrondi : les tables publient « < 0,5 » (ramené à 0) à côté de petites valeurs mesurées
+    if clean.get("sucres", 0) > clean.get("glucides", float("inf")) + ROUNDING:
         return "sucres supérieurs aux glucides"
-    if clean.get("ags", 0) > clean.get("lipides", float("inf")):
+    if clean.get("ags", 0) > clean.get("lipides", float("inf")) + ROUNDING:
         return "acides gras saturés supérieurs aux lipides"
     if sum(clean.get(k, 0) for k in ("proteines", "glucides", "lipides", "fibres")) > 105:
         return "somme protéines + glucides + lipides + fibres supérieure à 105 g pour 100 g"

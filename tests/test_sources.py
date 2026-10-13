@@ -118,3 +118,31 @@ async def test_poids_sans_unite(fields, poids):
     product["product"].update(fields)
     t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
     assert (await FoodSources(transport=t).off("3017620422003"))["poids"] == poids
+
+
+async def test_r_c1_nan_infinity_et_usda_piege():
+    """Revue C1 : NaN / Infinity / nutrientId non entier ne font pas planter ; valeurs ignorées."""
+    body = b'{"status": 1, "product": {"product_name": "X", "nutriments": {"energy-kcal_100g": NaN, "proteins_100g": Infinity, "fat_100g": "nan", "carbohydrates_100g": 12}}}'
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, content=body)})
+    found = await FoodSources(transport=t).off("3017620422003")
+    assert found["valeurs"] == {"glucides": 12}
+    usda = {"foods": [{"gtinUpc": "009800895007", "foodNutrients": [{"nutrientId": [1008], "value": 5}, {"nutrientId": 1008, "value": "inf"}, {"nutrientId": 1003, "value": 2}]}]}
+    t = transport({"https://api.nal.usda.gov/": httpx2.Response(200, json=usda)})
+    assert (await FoodSources(transport=t, usda_key="k").usda("009800895007"))["valeurs"] == {"proteines": 2}
+
+
+async def test_r_i1_kj_converti_en_kcal():
+    """Revue I1 : fiche avec l'énergie en kJ seulement → kcal = kJ / 4,184."""
+    product = {"status": 1, "product": {"product_name": "X", "nutriments": {"energy-kj_100g": 1506, "proteins_100g": 10}}}
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
+    assert (await FoodSources(transport=t).off("3017620422003"))["valeurs"]["kcal"] == 360
+
+
+async def test_r_c2_lot_jamais_devine_meme_avec_product_quantity():
+    product = json.loads(json.dumps(OFF_PRODUCT))
+    product["product"].update({"product_quantity": 500, "quantity": "4 x 125 g"})
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
+    assert (await FoodSources(transport=t).off("3017620422003"))["poids"] is None
+    product["product"].update({"product_quantity": None, "quantity": "500 gr"})
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
+    assert (await FoodSources(transport=t).off("3017620422003"))["poids"] == (500, False)

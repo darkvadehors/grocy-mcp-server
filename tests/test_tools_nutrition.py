@@ -92,7 +92,7 @@ async def test_completer_sans_code_barres_propose_ciqual(nutri, fake):
 async def test_completer_valeurs_aberrantes_refusees(nutri, fake, off):
     off["3017620422003"]["nutriments"] = {**LAIT, "energy-kcal_100g": 4000}
     preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
-    assert preview["lignes"][0]["statut"] == "refuse" and "900" in preview["lignes"][0]["raison"]
+    assert preview["lignes"][0]["statut"] == "refuse" and "905" in preview["lignes"][0]["raison"]
 
 
 async def test_completer_tous_les_produits_sans_donnees(nutri, fake):
@@ -159,3 +159,54 @@ async def test_isolation_jeton(nutri, fake):
     with pytest.raises(ToolFailure, match="confirmation"):
         await nutri.completer_nutrition(ELLI, ["lait"], jeton_confirmation=preview["jeton_confirmation"])
     assert writes(fake) == []
+
+
+async def test_r_c1_fiche_piegee_ne_plante_pas_l_apercu(nutri, fake, monkeypatch):
+    async def boom(code):
+        raise RecursionError("JSON trop imbriqué")
+    monkeypatch.setattr(nutri.sources, "off", boom)
+    preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
+    assert preview["lignes"][0]["statut"] in ("choisir_ciqual", "introuvable")
+
+
+async def test_r_c2_unite_de_stock_en_grammes(nutri, fake):
+    """Revue C2 : produit stocké en grammes → poids d'unité 1 g, jamais la contenance du paquet."""
+    fake.quantity_units.append({"id": 2, "name": "g", "name_plural": "g"})
+    fake.products[1]["qu_id_stock"] = 2
+    preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
+    line = preview["lignes"][0]
+    assert line["poids_unite_g"] == 1 and line["unite_stock"] == "g"
+
+
+async def test_r_i1_valeurs_sans_kcal_non_ecrites(nutri, fake, off):
+    off["3017620422003"]["nutriments"] = {"proteins_100g": 3}
+    preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
+    assert preview["lignes"][0]["statut"] != "trouve"
+
+
+async def test_r_i4_energie_native_existante_signalee(nutri, fake):
+    fake.products[1]["calories"] = 500
+    preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
+    assert "500" in preview["lignes"][0]["avertissement"]
+
+
+async def test_r_i5_jeton_conserve_si_quota_atteint(nutri, fake, clock):
+    """Revue I5 : quota atteint à la confirmation → le jeton reste valable, pas besoin de refaire l'aperçu."""
+    preview = await nutri.completer_nutrition(JOHNNY, ["lait"])
+    nutri._consume_quota(JOHNNY, 30)
+    with pytest.raises(ToolFailure, match="Limite"):
+        await nutri.completer_nutrition(JOHNNY, ["lait"], jeton_confirmation=preview["jeton_confirmation"])
+    clock.advance(61)
+    done = await nutri.completer_nutrition(JOHNNY, ["lait"], jeton_confirmation=preview["jeton_confirmation"])
+    assert done["statut"] == "ok"
+
+
+async def test_r_liste_vide_refusee(nutri):
+    with pytest.raises(ToolFailure):
+        await nutri.completer_nutrition(JOHNNY, [])
+
+
+async def test_r_valeurs_grocy_invalides_ignorees_dans_l_autonomie(nutri, fake):
+    set_data(fake, 1, kcal=5000, poids=1000)
+    out = await nutri.autonomie_alimentaire(JOHNNY)
+    assert "Lait demi-écrémé" in [p["nom"] for p in out["sans_donnees"]] and out["total"]["kcal"] == 0

@@ -63,7 +63,7 @@ def values(**overrides):
         {"kcal": 4000},
         {"kcal": -1},
         {"sucres": 80},  # > glucides
-        {"ags": 3},  # > lipides
+        {"ags": 4},  # > lipides + tolérance d'arrondi
         {"proteines": 101},
         {"glucides": 90, "proteines": 20},  # somme > 105 g
     ],
@@ -109,3 +109,14 @@ def test_classement_ciqual_reel():
     assert first["nom"].lower().startswith("lentille") and "kcal" in first
     assert index.search("riz blanc cuit")[0]["nom"] == "Riz blanc, cuit, non salé"
     assert index.search("pomme crue")[0]["nom"].lower().startswith("pomme") and "kcal" in index.search("pomme crue")[0]
+
+
+def test_r_i2_tous_les_aliments_ciqual_passent_le_controle():
+    """Revue I2 : les vraies valeurs Ciqual (huiles à 901 kcal, arrondis « < x ») ne sont pas refusées."""
+    refused = [(f["code"], check_values(f)) for f in CiqualIndex()._foods if check_values(f)]
+    assert refused == []
+    assert check_values({"kcal": 901}) is None and check_values({"kcal": 950})
+
+
+def test_r_ciqual_candidats_avec_valeurs_seulement():
+    assert all("kcal" in f for f in CiqualIndex().search("pomme", limit=10))

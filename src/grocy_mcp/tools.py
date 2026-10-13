@@ -55,6 +55,14 @@ NUTRI_FIELDS = {
     "sel": "nutri_sel_100g",
 }
 NUTRI_WEIGHT, NUTRI_SOURCE, NUTRI_NON_FOOD = "nutri_poids_unite_g", "nutri_source", "nutri_non_alimentaire"
+PRODUCT_LOOKUP_SECONDS = 25
+# Unités de stock de masse ou de volume (nom replié) → (grammes par unité, approximatif ?)
+_UNIT_GRAMS = {
+    "g": (1, False), "gr": (1, False), "gramme": (1, False), "grammes": (1, False), "gram": (1, False),
+    "kg": (1000, False), "kilo": (1000, False), "kilos": (1000, False), "kilogramme": (1000, False),
+    "kilogrammes": (1000, False), "ml": (1, True), "millilitre": (1, True), "millilitres": (1, True),
+    "cl": (10, True), "l": (1000, True), "litre": (1000, True), "litres": (1000, True),
+}
 _SLOW = object()  # recherche externe trop lente (aperçu d'import)
 UNAVAILABLE = "Grocy ne répond pas pour le moment. Réessayez dans quelques instants."
 
@@ -1265,7 +1273,7 @@ class ToolService:
 
         return await self._grocy(caller, run)
 
-    async def _find_nutrition(self, client: GrocyClient, product: dict, codes: list[str]) -> dict:
+    async def _find_nutrition(self, client: GrocyClient, product: dict, codes: list[str], unit: str | None) -> dict:
         """Proposition pour un produit sans données : Open Food Facts puis USDA par code-barres, sinon Ciqual."""
         name = clean_text(product["name"])
         unavailable = False
@@ -1273,25 +1281,35 @@ class ToolService:
             for fetch in (self.sources.off, self.sources.usda):
                 try:
                     found = await fetch(code)
-                except SourceError:
+                except (SourceError, ValueError, TypeError, OverflowError, RecursionError):  # fiche piégée ou source en panne
                     unavailable = True
                     continue
-                if not found:
+                if not found or "kcal" not in found["valeurs"]:  # sans énergie, inutile pour l'autonomie
                     continue
                 reason = check_values(found["valeurs"])
                 if reason:
                     return {"produit": name, "statut": "refuse", "source": found["source"], "raison": reason}
                 weight = found["poids"]
-                return {
+                per_unit = _UNIT_GRAMS.get(fold(unit or ""))
+                if per_unit:  # stock compté en g, kg, ml, l… : le poids d'une unité est fixe, pas celui du paquet
+                    weight = per_unit
+                line = {
                     "produit": name,
                     "statut": "trouve",
                     "source": found["source"],
                     "reference": found["reference"],
                     "nom_source": found["nom"],
                     "valeurs": found["valeurs"],
+                    "unite_stock": unit,
                     "poids_unite_g": weight[0] if weight else None,
                     "approximatif": bool(weight and weight[1]),
                 }
+                if weight is None:
+                    line["message"] = "Poids d'une unité inconnu : à fixer avec definir_nutrition(poids_unite_g=…)."
+                calories = _to_number(product.get("calories"))
+                if calories:
+                    line["avertissement"] = f"L'énergie saisie dans Grocy ({calories} kcal par unité) sera remplacée."
+                return line
         candidates = [
             {"code": f["code"], "nom": f["nom"], "kcal": f.get("kcal")} for f in self.ciqual.search(name, limit=3)
         ]
@@ -1312,14 +1330,23 @@ class ToolService:
         self, caller: Caller, produits: list[str] | None = None, jeton_confirmation: str | None = None
     ) -> dict:
         tool = "completer_nutrition"
-        if produits is not None and (not isinstance(produits, list) or len(produits) > MAX_IMPORT):
-            raise ToolFailure(f"produits doit être une liste de {MAX_IMPORT} noms au plus (ou absent : tous).")
+        if produits is not None and (not isinstance(produits, list) or not produits or len(produits) > MAX_IMPORT):
+            raise ToolFailure(f"produits doit être une liste de 1 à {MAX_IMPORT} noms (ou absent : tous les produits).")
         names = [clean_text(p) for p in produits or []]
         digest = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode()).hexdigest()
         if jeton_confirmation:
             payload = self._take_confirmation(caller, tool, jeton_confirmation)
             if payload.get("empreinte") != digest:
                 raise ToolFailure("Liste différente de celle de l'aperçu : rien n'a été écrit. Redemandez un aperçu.")
+            if len(payload["plan"]) > self._quota_left(caller):  # le jeton reste valable : réessayer plus tard
+                self.store.save_confirmation(
+                    sha256_hex(clean_text(jeton_confirmation, 100)), caller.grocy_user_id, tool,
+                    json.dumps(payload), self.store.now() + CONFIRMATION_TTL,
+                )
+                raise ToolFailure(
+                    f"Limite d'actions atteinte ({len(payload['plan'])} écritures) : rien n'a été écrit, le jeton reste "
+                    "valable 5 minutes. Réessayez dans une minute."
+                )
             return await self._nutrition_confirm(caller, payload["plan"])
 
         async def preview(client: GrocyClient) -> dict:
@@ -1340,14 +1367,35 @@ class ToolService:
                 targets = pending[:MAX_IMPORT]
                 if len(pending) > MAX_IMPORT:
                     lines.append({"statut": "suite", "message": f"{len(pending) - MAX_IMPORT} autres produits : rappelez ensuite."})
-            plan = []
+            units = {int(u["id"]): str(u.get("name") or "") for u in await client.quantity_units()}
+            plan, todo = [], []
             for product in targets:
                 data = self._nutri(product)
                 if data["valeurs"] or data["non_alimentaire"]:
                     lines.append({"produit": clean_text(product["name"]), "statut": "deja_renseigne",
                                   "message": "Déjà renseigné : utilisez definir_nutrition pour modifier."})
-                    continue
-                line = await self._find_nutrition(client, product, barcodes.get(int(product["id"]), []))
+                else:
+                    todo.append(product)
+            found: dict[int, dict] = {}
+            limit = anyio.Semaphore(5)
+
+            async def one(product: dict) -> None:
+                async with limit:
+                    unit = units.get(int(product.get("qu_id_stock") or 0))
+                    try:
+                        with anyio.fail_after(PRODUCT_LOOKUP_SECONDS):
+                            found[int(product["id"])] = await self._find_nutrition(
+                                client, product, barcodes.get(int(product["id"]), []), unit
+                            )
+                    except TimeoutError:
+                        found[int(product["id"])] = {"produit": clean_text(product["name"]), "statut": "introuvable",
+                                                     "message": "Sources trop lentes pour ce produit : relancez plus tard."}
+
+            async with anyio.create_task_group() as group:
+                for product in todo:
+                    group.start_soon(one, product)
+            for product in todo:
+                line = found[int(product["id"])]
                 lines.append(line)
                 if line["statut"] == "trouve":
                     plan.append({**line, "product_id": int(product["id"])})
@@ -1414,6 +1462,8 @@ class ToolService:
             food = self.ciqual.get(ciqual) if isinstance(ciqual, int) and not isinstance(ciqual, bool) else None
             if food is None:
                 raise ToolFailure("Code Ciqual inconnu : reprenez un code proposé par completer_nutrition.")
+            if "kcal" not in food:
+                raise ToolFailure("Cet aliment Ciqual n'a pas de valeur d'énergie : choisissez-en un autre.")
             new_values = {k: food[k] for k in NUTRI_FIELDS if k in food}
             source = clean_text(f"Ciqual {food['code']} — {food['nom']}", 200)
         if valeurs is not None:
@@ -1471,7 +1521,9 @@ class ToolService:
                 if not inclure_perimes and str(lot.get("best_before_date") or "9999") < today:
                     expired += 1
                     continue
-                if "kcal" not in data["valeurs"] or not data["poids"]:
+                weight = data["poids"]
+                valid = "kcal" in data["valeurs"] and weight and 1 <= weight <= 50_000 and not check_values(data["valeurs"])
+                if not valid:  # absentes, ou saisies à la main de façon invraisemblable
                     missing[int(product["id"])] = clean_text(product["name"])
                     continue
                 covered.add(int(product["id"]))

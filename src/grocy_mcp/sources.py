@@ -6,6 +6,7 @@ Liste fermée d'hôtes, HTTPS, sans redirection, délai et taille de réponse pl
 from __future__ import annotations
 
 import json
+import math
 import re
 import unicodedata
 
@@ -15,6 +16,7 @@ from grocy_mcp import __version__
 from grocy_mcp.nutrition import weight_in_grams
 
 _BARCODE = re.compile(r"[0-9]{8,14}")
+_MULTIPACK = re.compile(r"\d\s*[x×*]\s*\d", re.I)
 OFF_URL = "https://world.openfoodfacts.org/api/v2/product/{code}.json"
 USDA_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 TIMEOUT = 10.0
@@ -45,14 +47,14 @@ def _clean(value: object, limit: int = 120) -> str:
 
 
 def _number(value: object) -> float | None:
-    if isinstance(value, bool):
+    """Nombre fini, ou None (texte illisible, booléen, NaN et infini refusés : la base est participative)."""
+    if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, int | float):
-        return float(value) if value == value else None
     try:
-        return float(str(value).replace(",", "."))
-    except ValueError:
+        number = float(value) if isinstance(value, int | float) else float(str(value).replace(",", "."))
+    except (ValueError, OverflowError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _compact(value: float) -> float | int:
@@ -62,13 +64,15 @@ def _compact(value: float) -> float | int:
 def _metric_weight(text: object) -> tuple[float, bool] | None:
     """« 400 g », « 1,5 kg », « 13 oz/371 g » → poids ; un lot (« 6 x 33 cl ») n'est pas deviné."""
     text = str(text or "")
-    if re.search(r"\d\s*[x×*]\s*\d", text, re.I):
+    if _MULTIPACK.search(text):
         return None
-    match = re.search(r"(\d+(?:[.,]\d+)?)\s*(kg|mg|g|cl|dl|ml|l)\b", text, re.I)
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*(kg|mg|gr|g|cl|dl|ml|l)\b", text, re.I)
     return weight_in_grams(_number(match.group(1)), match.group(2)) if match else None
 
 
 def _off_weight(product: dict) -> tuple[float, bool] | None:
+    if _MULTIPACK.search(str(product.get("quantity") or "")):  # « 4 x 125 g » : poids d'une unité inconnu
+        return None
     amount = _number(product.get("product_quantity"))
     if amount is not None:
         return weight_in_grams(amount, product.get("product_quantity_unit") or "g")  # unité absente : grammes
@@ -119,6 +123,10 @@ class FoodSources:
             number = _number(nutriments.get(field))
             if number is not None:
                 values[key] = _compact(number)
+        if "kcal" not in values:  # énergie seulement en kJ sur beaucoup de fiches
+            kj = _number(nutriments.get("energy-kj_100g")) or _number(nutriments.get("energy_100g"))
+            if kj is not None:
+                values["kcal"] = round(kj / 4.184)
         if not values:
             return None
         return {
@@ -151,9 +159,12 @@ class FoodSources:
             number = _number(item.get("value"))
             if number is None:
                 continue
-            if item.get("nutrientId") in _USDA_FIELDS:
-                values[_USDA_FIELDS[item["nutrientId"]]] = _compact(number)
-            elif item.get("nutrientId") == _USDA_SODIUM_MG:
+            nutrient = item.get("nutrientId")
+            if not isinstance(nutrient, int) or isinstance(nutrient, bool):
+                continue
+            if nutrient in _USDA_FIELDS:
+                values[_USDA_FIELDS[nutrient]] = _compact(number)
+            elif nutrient == _USDA_SODIUM_MG:
                 values["sel"] = round(number * 2.5 / 1000, 4)  # sel = sodium × 2,5
         if not values:
             return None
