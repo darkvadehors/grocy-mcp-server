@@ -210,3 +210,13 @@ async def test_r_valeurs_grocy_invalides_ignorees_dans_l_autonomie(nutri, fake):
     set_data(fake, 1, kcal=5000, poids=1000)
     out = await nutri.autonomie_alimentaire(JOHNNY)
     assert "Lait demi-écrémé" in [p["nom"] for p in out["sans_donnees"]] and out["total"]["kcal"] == 0
+
+
+async def test_rechercher_ciqual(nutri):
+    """Nom de produit trop précis : l'IA cherche elle-même dans Ciqual avec des mots simples."""
+    out = await nutri.rechercher_ciqual(JOHNNY, "café soluble")
+    assert out["candidats"] and all({"code", "nom", "kcal"} <= set(c) for c in out["candidats"])
+    assert any("soluble" in c["nom"].lower() for c in out["candidats"])
+    assert (await nutri.rechercher_ciqual(JOHNNY, "zzzz"))["candidats"] == []
+    with pytest.raises(ToolFailure):
+        await nutri.rechercher_ciqual(JOHNNY, "  ")

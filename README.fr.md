@@ -41,6 +41,7 @@ Construit sur le SDK Python officiel de MCP (`mcp==2.3.0`) : le même processus 
 | `creer_categorie` | Créer une catégorie (groupe de produits) | action |
 | `voir_nutrition` | Apports nutritionnels d'un produit (pour 100 g, par unité de stock) | lecture |
 | `completer_nutrition` | Compléter les apports manquants en deux temps (Open Food Facts, puis USDA par code-barres ; candidats Ciqual pour le vrac) | action |
+| `rechercher_ciqual` | Chercher un aliment dans la table Ciqual avec des mots simples, pour choisir un code pour `definir_nutrition` | lecture |
 | `definir_nutrition` | Fixer les apports d'un produit (code Ciqual ou valeurs), le poids d'une unité, ou le marquer non alimentaire | action |
 | `autonomie_alimentaire` | Nombre de jours que le foyer peut tenir avec le stock actuel (énergie, protéines), calculé par le serveur | lecture |
 | `annuler_derniere_action` | Annuler la dernière action faite par ce serveur | action |

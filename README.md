@@ -41,6 +41,7 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 | `creer_categorie` | Create a product group | action |
 | `voir_nutrition` | Nutrition facts of a product (per 100 g, per stock unit) | read |
 | `completer_nutrition` | Fill missing nutrition facts in two steps (Open Food Facts, then USDA by barcode; Ciqual candidates for bulk food) | action |
+| `rechercher_ciqual` | Search the Ciqual table with simple words, to pick a code for `definir_nutrition` | read |
 | `definir_nutrition` | Set a product's nutrition facts (Ciqual code or values), unit weight, or mark it non-food | action |
 | `autonomie_alimentaire` | How many days the household can live on the current stock (energy, proteins), computed by the server | read |
 | `annuler_derniere_action` | Undo the last action made through this server | action |

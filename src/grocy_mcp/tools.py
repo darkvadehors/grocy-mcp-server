@@ -1324,7 +1324,7 @@ class ToolService:
                 "message": f"{message} Choisissez un aliment Ciqual avec la personne, puis appelez definir_nutrition "
                 "avec son code (et poids_unite_g si possible).",
             }
-        return {"produit": name, "statut": "introuvable", "message": f"{message} Rien dans Ciqual non plus : definir_nutrition(valeurs=…)."}
+        return {"produit": name, "statut": "introuvable", "message": f"{message} Rien dans Ciqual sous ce nom : cherchez avec rechercher_ciqual (mots simples), ou definir_nutrition(valeurs=…)."}
 
     async def completer_nutrition(
         self, caller: Caller, produits: list[str] | None = None, jeton_confirmation: str | None = None
@@ -1496,6 +1496,21 @@ class ToolService:
             return {"statut": "ok", "produit": name, "message": f"Apports de {name} mis à jour."}
 
         return await self._action(caller, "definir_nutrition", args, cle_idempotence, run)
+
+    async def rechercher_ciqual(self, caller: Caller, texte: str) -> dict:
+        """Recherche libre dans la table Ciqual (aucun appel à Grocy) : pour choisir le code de definir_nutrition."""
+        text = clean_text(texte)
+        if not text.strip():
+            raise ToolFailure("Indiquez un aliment à chercher, en mots simples (par exemple « café soluble »).")
+        foods = self.ciqual.search(text, limit=8)
+        return {
+            "candidats": [
+                {"code": f["code"], "nom": f["nom"], "kcal": f.get("kcal"), "proteines": f.get("proteines")} for f in foods
+            ],
+            "message": "Choisissez avec la personne, puis appelez definir_nutrition(produit, ciqual=code)."
+            if foods
+            else "Aucun aliment Ciqual : essayez d'autres mots, plus génériques.",
+        }
 
     async def autonomie_alimentaire(self, caller: Caller, inclure_perimes: bool = False) -> dict:
         if not self.settings.household:

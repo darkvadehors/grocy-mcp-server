@@ -205,8 +205,14 @@ def register_tools(server: MCPServer, service: ToolService) -> None:
         Ciqual pour le vrac), en deux temps : aperçu, puis rappel avec les mêmes produits et jeton_confirmation après
         accord de la personne. Sans « produits » : tous les produits sans données (30 par appel). Ne remplace jamais
         des apports existants. Pour un statut « choisir_ciqual », faites choisir un candidat puis appelez
-        definir_nutrition avec son code."""
+        definir_nutrition avec son code ; pour « introuvable », cherchez avec rechercher_ciqual."""
         return await _call(service.completer_nutrition, produits, jeton_confirmation)
+
+    @server.tool(title="Chercher un aliment dans Ciqual", annotations=READ)
+    async def rechercher_ciqual(texte: str) -> dict:
+        """Cherche un aliment générique dans la table Ciqual (Anses) avec des mots simples (« café soluble », « riz
+        blanc cuit »), quand le nom du produit est trop précis pour être trouvé. Renvoie des codes pour definir_nutrition."""
+        return await _call(service.rechercher_ciqual, texte)
 
     @server.tool(title="Définir les apports d'un produit", annotations=CHANGE)
     async def definir_nutrition(

@@ -21,7 +21,7 @@ TOOLS = {
     "rechercher_produit", "voir_stock", "voir_peremptions", "voir_produit", "voir_liste_courses",
     "recettes_faisables", "voir_references", "ajouter_liste_courses", "retirer_liste_courses",
     "ajouter_manquants_liste", "enregistrer_achat", "consommer", "ouvrir", "deplacer",
-    "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie", "voir_nutrition", "completer_nutrition", "definir_nutrition", "autonomie_alimentaire"}
+    "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie", "voir_nutrition", "completer_nutrition", "definir_nutrition", "autonomie_alimentaire", "rechercher_ciqual"}
 SECRETS: list[str] = []
 
 
@@ -252,7 +252,7 @@ async def test_import_de_bout_en_bout(http, fake):
     _, tokens, _, _ = await login(http)
     access = tokens["access_token"]
     listing = (await rpc(http, access, "tools/list")).json()["result"]["tools"]
-    assert len(listing) == 23
+    assert len(listing) == 24
     importer = next(t for t in listing if t["name"] == "importer_articles")
     assert "FoodShiner" in importer["description"] and importer["annotations"]["destructiveHint"] is False
     fake.lookup_db["5449000000996"] = {"name": "Coca-Cola 33 cl"}
