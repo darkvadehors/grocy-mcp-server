@@ -39,9 +39,26 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 | `importer_articles` | Import a list of scanned items (e.g. a FoodShiner backup) in two steps: preview, then confirmation; unknown barcodes are identified with Grocy's external barcode lookup | action |
 | `creer_emplacement` | Create a location | action |
 | `creer_categorie` | Create a product group | action |
+| `voir_nutrition` | Nutrition facts of a product (per 100 g, per stock unit) | read |
+| `completer_nutrition` | Fill missing nutrition facts in two steps (Open Food Facts, then USDA by barcode; Ciqual candidates for bulk food) | action |
+| `definir_nutrition` | Set a product's nutrition facts (Ciqual code or values), unit weight, or mark it non-food | action |
+| `autonomie_alimentaire` | How many days the household can live on the current stock (energy, proteins), computed by the server | read |
 | `annuler_derniere_action` | Undo the last action made through this server | action |
 
 Tool names and messages are in French.
+
+## Nutrition
+
+Nutrition facts are stored in Grocy product userfields (`nutri_kcal_100g`, `nutri_proteines_100g`, `nutri_glucides_100g`, `nutri_sucres_100g`, `nutri_lipides_100g`, `nutri_ags_100g`, `nutri_fibres_100g`, `nutri_sel_100g`, `nutri_poids_unite_g`, `nutri_source`, `nutri_non_alimentaire`), which must be created once in Grocy (type decimal number, text, checkbox). Grocy's own *Energy* field (kcal per stock unit) is filled too, so stock and recipe screens show energy. Values are checked for plausibility before being written; existing values are never overwritten by `completer_nutrition`.
+
+Daily needs are average EFSA reference values (moderate activity), not personal advice.
+
+The server then also calls `world.openfoodfacts.org` and, if configured, `api.nal.usda.gov` (HTTPS only, no redirects, size-capped).
+
+Data sources:
+- **Ciqual** — Anses. 2020. Table de composition nutritionnelle des aliments Ciqual, https://ciqual.anses.fr — Licence Ouverte / Open Licence (Etalab). Embedded as `src/grocy_mcp/data/ciqual-2020.json`, regenerated with `scripts/build_ciqual.py`.
+- **Open Food Facts** — https://world.openfoodfacts.org, data under the Open Database License (ODbL).
+- **USDA FoodData Central** — public domain (CC0).
 
 ## Grocy prerequisites
 
@@ -71,6 +88,8 @@ Then create an API key for that account (Grocy → user menu → Manage API keys
 | `MCP_EXTRA_REDIRECT_URIS` | Additional redirect URIs, space separated |
 | `MCP_ALLOWED_ORIGINS` | Allowed `Origin` values on `/mcp` |
 | `MCP_TIMEZONE` | Time zone of the people (default `UTC`), e.g. `Europe/Zurich` |
+| `MCP_HOUSEHOLD` | Household for `autonomie_alimentaire`, adults only, e.g. `H:50,F:54` (H = man, F = woman, age) |
+| `MCP_USDA_KEY_FILE` | Optional FoodData Central API key file |
 
 Master key:
 

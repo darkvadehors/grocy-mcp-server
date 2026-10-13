@@ -39,7 +39,24 @@ Construit sur le SDK Python officiel de MCP (`mcp==2.3.0`) : le même processus 
 | `importer_articles` | Importer une liste d'articles scannés (par exemple une sauvegarde FoodShiner) en deux temps : aperçu, puis confirmation ; les codes-barres inconnus sont identifiés par la recherche externe de Grocy | action |
 | `creer_emplacement` | Créer un emplacement | action |
 | `creer_categorie` | Créer une catégorie (groupe de produits) | action |
+| `voir_nutrition` | Apports nutritionnels d'un produit (pour 100 g, par unité de stock) | lecture |
+| `completer_nutrition` | Compléter les apports manquants en deux temps (Open Food Facts, puis USDA par code-barres ; candidats Ciqual pour le vrac) | action |
+| `definir_nutrition` | Fixer les apports d'un produit (code Ciqual ou valeurs), le poids d'une unité, ou le marquer non alimentaire | action |
+| `autonomie_alimentaire` | Nombre de jours que le foyer peut tenir avec le stock actuel (énergie, protéines), calculé par le serveur | lecture |
 | `annuler_derniere_action` | Annuler la dernière action faite par ce serveur | action |
+
+## Apports nutritionnels
+
+Les apports sont rangés dans des champs personnalisés des produits Grocy (`nutri_kcal_100g`, `nutri_proteines_100g`, `nutri_glucides_100g`, `nutri_sucres_100g`, `nutri_lipides_100g`, `nutri_ags_100g`, `nutri_fibres_100g`, `nutri_sel_100g`, `nutri_poids_unite_g`, `nutri_source`, `nutri_non_alimentaire`), à créer une fois dans Grocy (nombre décimal, texte, case à cocher). Le champ natif *Énergie* de Grocy (kcal par unité de stock) est aussi rempli : les écrans de stock et de recettes affichent l'énergie. Les valeurs sont contrôlées avant écriture ; `completer_nutrition` ne remplace jamais des valeurs existantes.
+
+Les besoins quotidiens sont des valeurs de référence moyennes de l'EFSA (activité modérée), pas un conseil personnalisé.
+
+Le serveur appelle alors aussi `world.openfoodfacts.org` et, s'il est configuré, `api.nal.usda.gov` (HTTPS seulement, sans redirection, taille plafonnée).
+
+Sources des données :
+- **Ciqual** — Anses. 2020. Table de composition nutritionnelle des aliments Ciqual, https://ciqual.anses.fr — Licence Ouverte (Etalab). Embarquée dans `src/grocy_mcp/data/ciqual-2020.json`, régénérée par `scripts/build_ciqual.py`.
+- **Open Food Facts** — https://world.openfoodfacts.org, données sous Open Database License (ODbL).
+- **USDA FoodData Central** — domaine public (CC0).
 
 ## Prérequis Grocy
 
@@ -69,6 +86,8 @@ Créer ensuite une clé API pour ce compte (Grocy → menu de l'utilisateur → 
 | `MCP_EXTRA_REDIRECT_URIS` | URI de retour supplémentaires, séparées par des espaces |
 | `MCP_ALLOWED_ORIGINS` | Valeurs d'`Origin` autorisées sur `/mcp` |
 | `MCP_TIMEZONE` | Fuseau horaire des personnes (`UTC` par défaut), par exemple `Europe/Zurich` |
+| `MCP_HOUSEHOLD` | Foyer pour `autonomie_alimentaire`, adultes uniquement, par exemple `H:50,F:54` (H = homme, F = femme, âge) |
+| `MCP_USDA_KEY_FILE` | Fichier de clé FoodData Central (facultatif) |
 
 Clé maître :
 
