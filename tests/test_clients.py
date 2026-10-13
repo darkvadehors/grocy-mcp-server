@@ -51,7 +51,7 @@ def test_extra_redirects():
 @pytest.mark.parametrize(
     ("name", "provider"),
     [("Claude", "claude"), ("claude code", "claude"), ("Anthropic MCP", "claude"), ("ChatGPT", "chatgpt"),
-     ("OpenAI connector", "chatgpt"), ("Mon outil", None), (None, None), ("C l a u d e", None), ("Сlaude", "claude")],
+     ("OpenAI connector", "chatgpt"), ("Mon outil", None), (None, None), ("C l a u d e", "claude"), ("Сlaude", "claude")],
 )
 def test_claimed_provider(name, provider):
     assert claimed_provider(name) == provider
@@ -101,3 +101,17 @@ def test_clean_name():
     assert clean_name(None) == "Application sans nom"
     assert clean_name("A\x00B‮C") == "ABC"
     assert len(clean_name("x" * 500)) == 60
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Cl​aude", "Cl­aude", "C l a u d e", "Cláude", "C.L.A.U.D.E", "CIaude", "C1aude", "Chat⁠GPT", "Ϲhatgрt", "Сlauԁe", "Open AI"],
+)
+def test_reserved_names_cannot_be_disguised(name):
+    """Caractères invisibles, espaces, accents ou lettres d'autres alphabets ne contournent pas la réservation."""
+    assert claimed_provider(name) is not None
+
+
+@pytest.mark.parametrize("name", ["Mon assistant", "Clavier", "Ordinateur de cuisine", None, ""])
+def test_ordinary_names_are_not_reserved(name):
+    assert claimed_provider(name) is None

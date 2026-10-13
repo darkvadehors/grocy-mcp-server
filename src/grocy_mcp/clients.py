@@ -16,8 +16,26 @@ _CHATGPT = {"https://chatgpt.com/connector_platform_oauth_redirect"}
 _CHATGPT_CALLBACK = re.compile(r"https://chatgpt\.com/connector/oauth/[A-Za-z0-9_-]{1,128}")
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _PROVIDER_WORDS = {"claude": "claude", "anthropic": "claude", "chatgpt": "chatgpt", "openai": "chatgpt"}
-# Lettres latines imitées par des caractères d'autres alphabets (le cyrillique « С » de « Сlaude », etc.).
-_CONFUSABLES = str.maketrans({"а": "a", "с": "c", "е": "e", "о": "o", "р": "p", "і": "i", "ӏ": "l", "υ": "u", "ο": "o"})
+# Caractères qui imitent des lettres latines (cyrillique, grec, chiffres) ; « i », « 1 » et « | » sont rapprochés de « l »
+# (« CIaude », « C1aude »). Le même squelette est appliqué aux noms réservés, la comparaison reste donc cohérente.
+_CONFUSABLES = str.maketrans(
+    {
+        "а": "a", "ɑ": "a", "α": "a", "с": "c", "ϲ": "c", "ԁ": "d", "е": "e", "ε": "e", "һ": "h", "і": "l", "ӏ": "l",
+        "ι": "l", "ј": "j", "к": "k", "о": "o", "ο": "o", "р": "p", "ρ": "p", "ԛ": "q", "ѕ": "s", "т": "t", "υ": "u",
+        "ս": "u", "ν": "v", "ԝ": "w", "х": "x", "у": "y", "ɡ": "g", "i": "l", "1": "l", "|": "l", "!": "l", "0": "o",
+    }
+)
+
+
+def _skeleton(text: str) -> str:
+    """Forme de comparaison : compatibilité Unicode, sans casse, sans accents ni caractères invisibles, lettres seules."""
+    folded = text.casefold().translate(_CONFUSABLES)  # avant NFKC, qui change certaines lettres (« Ϲ » devient « Σ »)
+    folded = unicodedata.normalize("NFKC", folded).casefold().translate(_CONFUSABLES)
+    folded = "".join(ch for ch in unicodedata.normalize("NFKD", folded) if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z]", "", folded.translate(_CONFUSABLES))
+
+
+_RESERVED = {_skeleton(word): provider for word, provider in _PROVIDER_WORDS.items()}
 
 
 def is_loopback(uri: str) -> bool:
@@ -46,8 +64,8 @@ def classify_redirect(uri: str, extra: tuple[str, ...] = ()) -> str | None:
 def claimed_provider(name: str | None) -> str | None:
     if not name:
         return None
-    folded = unicodedata.normalize("NFKC", name).casefold().translate(_CONFUSABLES)
-    for word, provider in _PROVIDER_WORDS.items():
+    folded = _skeleton(name)
+    for word, provider in _RESERVED.items():
         if word in folded:
             return provider
     return None
