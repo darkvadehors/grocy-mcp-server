@@ -6,7 +6,9 @@ from grocy_mcp.audit import AuditLog
 from grocy_mcp.config import Settings
 from grocy_mcp.crypto import SecretBox, generate_key, load_key
 from grocy_mcp.store import Store
-from tests.fake_grocy import FakeGrocy
+from grocy_mcp.grocy import GrocyClient
+from grocy_mcp.tools import Caller, ToolService
+from tests.fake_grocy import KEY_ELLI_IA, KEY_JOHNNY_IA, FakeGrocy
 
 
 class Clock:
@@ -65,3 +67,16 @@ def audit(settings, clock):
 @pytest.fixture
 def box(settings):
     return SecretBox(load_key(settings.key_path))
+
+
+JOHNNY = Caller(grocy_user_id=3, family_id="f-johnny", client_id="c1")
+ELLI = Caller(grocy_user_id=4, family_id="f-elli", client_id="c1")
+
+
+@pytest.fixture
+def service(settings, store, box, audit, fake):
+    for uid, name, key in [(3, "johnny-ia", KEY_JOHNNY_IA), (4, "elli-ia", KEY_ELLI_IA)]:
+        store.upsert_account(uid, name, box.seal(key, f"grocy-user:{uid}"))
+    return ToolService(
+        settings, store, box, audit, lambda key: GrocyClient(settings.grocy_base_url, key, transport=fake.transport())
+    )
