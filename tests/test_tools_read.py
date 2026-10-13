@@ -96,8 +96,12 @@ async def test_recettes_faisables(service, fake):
 
 async def test_voir_references(service, fake):
     out = await service.voir_references(JOHNNY)
-    assert out == {"emplacements": ["Frigo", "Placard"], "unites": ["Pièce"]}
-    assert fake.paths() == [("GET", "/api/objects/locations"), ("GET", "/api/objects/quantity_units")]
+    assert out == {"emplacements": ["Frigo", "Placard"], "unites": ["Pièce"], "categories": []}
+    assert fake.paths() == [
+        ("GET", "/api/objects/locations"),
+        ("GET", "/api/objects/quantity_units"),
+        ("GET", "/api/objects/product_groups"),
+    ]
 
 
 async def test_free_text_is_cleaned(service, fake):
