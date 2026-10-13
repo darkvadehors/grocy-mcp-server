@@ -241,6 +241,7 @@ pydantic==2.14.1 \
     --hash=sha256:9195d967ec791692a04438115466764fb8b9a27b31f14a760437694f40d6b454 \
     --hash=sha256:94f478203dd03404682a1ada216965651dd74b1d2d5ffd62e00e0837caab5c26
     # via
+    #   grocy-mcp-server (pyproject.toml)
     #   mcp
     #   mcp-types
 pydantic-core==2.50.1 \
