@@ -127,6 +127,26 @@ class GrocyClient:
     async def list_users(self) -> None:
         await self._request("GET", "/api/users")
 
+    # --- données de base (permission Grocy MASTER_DATA_EDIT) -------------------------------------
+    _CREATABLE = frozenset({"products", "product_barcodes", "locations", "product_groups"})
+
+    async def external_lookup(self, code: str, add: bool = False) -> dict | None:
+        """Recherche du plugin multi-sources ; add=True crée le produit et son code-barres dans Grocy."""
+        if not _BARCODE.fullmatch(code):
+            raise GrocyRequestError("code-barres invalide (8 à 14 chiffres)")
+        params = {"add": "true"} if add else None
+        result = await self._request("GET", f"/api/stock/barcodes/external-lookup/{code}", params=params)
+        return result if isinstance(result, dict) else None
+
+    async def product_groups(self) -> list[dict]:
+        return await self._request("GET", "/api/objects/product_groups")
+
+    async def create_object(self, entity: str, data: dict) -> int:
+        if entity not in self._CREATABLE:
+            raise ValueError(f"création non autorisée : {entity}")
+        result = await self._request("POST", f"/api/objects/{entity}", body=data)
+        return _int_id(result["created_object_id"])
+
     # --- lectures --------------------------------------------------------------------------------
     async def products(self) -> list[dict]:
         return await self._request("GET", "/api/objects/products")

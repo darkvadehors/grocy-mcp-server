@@ -26,6 +26,7 @@ IA_PERMISSIONS = frozenset(
         "SHOPPINGLIST_ITEMS_ADD",
         "SHOPPINGLIST_ITEMS_DELETE",
         "RECIPES",
+        "MASTER_DATA_EDIT",
     }
 )
 
@@ -62,6 +63,9 @@ class FakeGrocy:
         self.barcodes = {"3017620422003": 1}
         self.locations = [{"id": 1, "name": "Frigo"}, {"id": 2, "name": "Placard"}]
         self.quantity_units = [{"id": 1, "name": "Pièce", "name_plural": "Pièces"}]
+        self.product_groups: list[dict] = []
+        self.lookup_db: dict[str, dict] = {}  # code-barres → proposition du plugin multi-sources
+        self.lookups: list[tuple[str, bool]] = []  # (code, add) dans l'ordre des appels
         self.recipes = [{"id": 1, "name": "Crêpes"}]
         self.fulfillment = [
             {"recipe_id": 1, "need_fulfilled": 0, "missing_products_count": 1, "product_names_comma_separated": "Beurre doux"}
@@ -138,7 +142,9 @@ class FakeGrocy:
         return [
             (r"/api/user", "GET", self._user),
             (r"/api/users", "GET", self._users),
-            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes)", "GET", self._objects),
+            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups)", "GET", self._objects),
+            (r"/api/objects/(products|product_barcodes|locations|product_groups)", "POST", self._create_object),
+            (r"/api/stock/barcodes/external-lookup/([^/]+)", "GET", self._external_lookup),
             (r"/api/stock", "GET", self._stock),
             (r"/api/stock/volatile", "GET", self._volatile),
             (r"/api/stock/products/by-barcode/([^/]+)", "GET", self._by_barcode),
@@ -169,8 +175,61 @@ class FakeGrocy:
             "locations": self.locations,
             "quantity_units": self.quantity_units,
             "recipes": self.recipes,
+            "product_groups": self.product_groups,
         }[entity]
         return httpx2.Response(200, json=data)
+
+    # --- données de base (Grocy 4.7.1 : MASTER_DATA_EDIT, noms uniques) ---------------------------
+    def _insert(self, entity: str, data: dict) -> tuple[int | None, httpx2.Response | None]:
+        if entity == "product_barcodes":
+            if data.get("barcode") in self.barcodes:
+                return None, _err(400, "UNIQUE constraint failed: product_barcodes.barcode")
+            if int(data.get("product_id", 0)) not in self.products:
+                return None, _err(400, "product_id does not reference an existing product")
+            self.barcodes[str(data["barcode"])] = int(data["product_id"])
+            return int(data["product_id"]), None
+        table = {"products": list(self.products.values()), "locations": self.locations, "product_groups": self.product_groups}[entity]
+        name = data.get("name")
+        if not name:
+            return None, _err(400, f"NOT NULL constraint failed: {entity}.name")
+        if any(row["name"] == name for row in table):
+            return None, _err(400, f"UNIQUE constraint failed: {entity}.name")
+        new_id = next(self._ids)
+        row = {**data, "id": new_id, "active": 1}
+        if entity == "products":
+            for field_name in ("location_id", "qu_id_purchase", "qu_id_stock"):
+                if field_name not in data:
+                    return None, _err(400, f"NOT NULL constraint failed: products.{field_name}")
+            self.products[new_id] = row
+        else:
+            table.append(row)
+        return new_id, None
+
+    def _create_object(self, user, request, body, entity):
+        if not user.can("MASTER_DATA_EDIT"):
+            return _err(403, "Permission missing: MASTER_DATA_EDIT")
+        new_id, error = self._insert(entity, body)
+        return error or httpx2.Response(200, json={"created_object_id": new_id})
+
+    def _external_lookup(self, user, request, body, code):
+        if not user.can("MASTER_DATA_EDIT"):
+            return _err(403, "Permission missing: MASTER_DATA_EDIT")
+        add = request.url.params.get("add") in ("true", "1")
+        self.lookups.append((code, add))
+        found = self.lookup_db.get(code)
+        if found is None:
+            return httpx2.Response(200, json=None)
+        proposal = {"location_id": 1, "qu_id_purchase": 1, "qu_id_stock": 1, **found, "__barcode": code}
+        if not add:
+            return httpx2.Response(200, json=proposal)
+        data = {k: v for k, v in proposal.items() if not k.startswith("__")}
+        new_id, error = self._insert("products", data)
+        if error:
+            return error
+        _, error = self._insert("product_barcodes", {"product_id": new_id, "barcode": code})  # Grocy : produit déjà créé
+        if error:
+            return error
+        return httpx2.Response(200, json={**proposal, "id": new_id})
 
     def _grouped(self, entries: list[dict]) -> list[dict]:
         rows: dict[int, dict] = {}

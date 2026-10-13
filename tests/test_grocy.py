@@ -109,3 +109,40 @@ async def test_volatile_parameter(fake):
 async def test_ids_are_integers(fake):
     with pytest.raises(TypeError):
         await client(fake).product_details("1/../../users")
+
+
+async def test_external_lookup_preview_and_add(fake):
+    c = client(fake)
+    assert await c.external_lookup("5449000000996") is None  # inconnu du plugin : 200 avec null
+    fake.lookup_db["5449000000996"] = {"name": "Coca-Cola 33 cl", "description": "Source : Open Food Facts"}
+    preview = await c.external_lookup("5449000000996")
+    assert preview["name"] == "Coca-Cola 33 cl" and "id" not in preview
+    assert "5449000000996" not in fake.barcodes  # l'aperçu ne crée rien
+    created = await c.external_lookup("5449000000996", add=True)
+    assert fake.barcodes["5449000000996"] == created["id"] and fake.products[created["id"]]["name"] == "Coca-Cola 33 cl"
+    with pytest.raises(GrocyRequestError):
+        await c.external_lookup("12")
+
+
+async def test_external_lookup_requires_master_data_edit(fake):
+    fake.users[KEY_JOHNNY_IA].permissions.discard("MASTER_DATA_EDIT")
+    with pytest.raises(GrocyForbidden, match="MASTER_DATA_EDIT"):
+        await client(fake).external_lookup("5449000000996")
+
+
+async def test_create_objects_and_product_groups(fake):
+    c = client(fake)
+    loc = await c.create_object("locations", {"name": "Cave", "is_freezer": 0})
+    assert any(l["id"] == loc and l["name"] == "Cave" for l in await c.locations())
+    group = await c.create_object("product_groups", {"name": "Boissons"})
+    assert [g["id"] for g in await c.product_groups()] == [group]
+    pid = await c.create_object("products", {"name": "Eau", "location_id": loc, "qu_id_purchase": 1, "qu_id_stock": 1})
+    await c.create_object("product_barcodes", {"product_id": pid, "barcode": "3274080005003"})
+    assert (await c.product_by_barcode("3274080005003"))["product"]["id"] == pid
+    with pytest.raises(GrocyRequestError):
+        await c.create_object("locations", {"name": "Cave"})  # nom unique
+
+
+async def test_create_object_closed_list(fake):
+    with pytest.raises(ValueError):
+        await client(fake).create_object("users", {"username": "x"})
