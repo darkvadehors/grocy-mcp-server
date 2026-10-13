@@ -91,7 +91,8 @@ class GrocyClient:
         return f"GrocyClient({self._base_url!r}, <clé masquée>)"
 
     async def _request(self, method: str, path: str, *, params: dict | None = None, body: dict | None = None) -> Any:
-        assert path.startswith("/api/")
+        if not path.startswith("/api/"):
+            raise ValueError("chemin hors de l'API Grocy")
         headers = {"GROCY-API-KEY": self._key, "Accept": "application/json"}
         async with httpx2.AsyncClient(
             base_url=self._base_url,
