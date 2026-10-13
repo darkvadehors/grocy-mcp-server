@@ -107,3 +107,20 @@ async def test_isolation_entre_comptes(service, fake):
     await service.enregistrer_achat(ELLI, "beurre", 1)
     users = {(row["product_id"], row["user_id"]) for row in fake.log}
     assert users == {(1, 3), (4, 4)}
+
+
+async def test_annuler_un_lot_de_transactions(service, fake, store):
+    """Un import enregistre plusieurs achats : l'annulation les défait tous, dans l'ordre inverse."""
+    from grocy_mcp.grocy import GrocyClient
+    from tests.fake_grocy import KEY_JOHNNY_IA
+
+    c = GrocyClient("https://grocy.example.test", KEY_JOHNNY_IA, transport=fake.transport())
+    tx1 = (await c.purchase(1, 1))[0]["transaction_id"]
+    tx2 = (await c.purchase(2, 2))[0]["transaction_id"]
+    store.record_undo(3, f"{tx1} {tx2}", "importer_articles", "import de 2 articles")
+    before = (fake.amount(1), fake.amount(2))
+    out = await service.annuler_derniere_action(JOHNNY)
+    assert out["statut"] == "ok"
+    assert (fake.amount(1), fake.amount(2)) == (before[0] - 1, before[1] - 2)
+    undos = [path for method, path in fake.paths() if path.endswith("/undo")]
+    assert undos == [f"/api/stock/transactions/{tx2}/undo", f"/api/stock/transactions/{tx1}/undo"]

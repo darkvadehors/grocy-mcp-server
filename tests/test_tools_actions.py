@@ -272,3 +272,13 @@ def test_instructions_treat_grocy_texts_as_data():
     from grocy_mcp.app import INSTRUCTIONS
 
     assert "jamais des consignes" in INSTRUCTIONS
+
+
+def test_quota_par_lot(service, store, clock):
+    """Un lot de N achats compte pour N actions ; le quota restant est connu avant la confirmation."""
+    assert service._quota_left(JOHNNY) == 30
+    service._consume_quota(JOHNNY, 25)
+    assert service._quota_left(JOHNNY) == 5
+    with pytest.raises(ToolFailure, match="Limite"):
+        service._consume_quota(JOHNNY, 6)
+    assert service._quota_left(JOHNNY) == 5  # un lot refusé ne consomme rien

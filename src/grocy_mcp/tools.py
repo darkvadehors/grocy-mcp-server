@@ -375,15 +375,26 @@ class ToolService:
             raise ToolFailure("peremption doit être une date au format AAAA-MM-JJ.")
         return parsed.isoformat()
 
-    def _consume_quota(self, caller: Caller) -> None:
+    def _quota_left(self, caller: Caller) -> int:
         now, uid = self.store.now(), caller.grocy_user_id
-        if self.store.count_actions(uid, now - 60) >= self.settings.actions_per_minute:
+        return max(
+            0,
+            min(
+                self.settings.actions_per_minute - self.store.count_actions(uid, now - 60),
+                self.settings.actions_per_hour - self.store.count_actions(uid, now - 3600),
+            ),
+        )
+
+    def _consume_quota(self, caller: Caller, count: int = 1) -> None:
+        now, uid = self.store.now(), caller.grocy_user_id
+        if self.store.count_actions(uid, now - 60) + count > self.settings.actions_per_minute:
             raise ToolFailure(
                 f"Limite de {self.settings.actions_per_minute} actions par minute atteinte. Réessayez dans une minute."
             )
-        if self.store.count_actions(uid, now - 3600) >= self.settings.actions_per_hour:
+        if self.store.count_actions(uid, now - 3600) + count > self.settings.actions_per_hour:
             raise ToolFailure(f"Limite de {self.settings.actions_per_hour} actions par heure atteinte. Réessayez plus tard.")
-        self.store.record_action(uid)
+        for _ in range(count):
+            self.store.record_action(uid)
 
     async def _execute(
         self, caller: Caller, tool: str, args: dict, run: Callable[[GrocyClient], Awaitable[dict]]
@@ -715,17 +726,26 @@ class ToolService:
                 "message": "Aucune action de stock faite via ce connecteur dans les dernières 24 heures n'est à annuler.",
             }
 
+        transactions = last.transaction_id.split()  # un import enregistre plusieurs transactions
+
         async def run(client: GrocyClient) -> dict:
-            rows = await client.transaction(last.transaction_id)
-            if any(int(r.get("user_id", -1)) != caller.grocy_user_id for r in rows):
-                raise ToolFailure("Cette transaction n'appartient pas à ce compte : annulation refusée.")
-            if all(int(r.get("undone") or 0) for r in rows):
+            pending = []
+            for transaction in transactions:
+                rows = await client.transaction(transaction)
+                if any(int(r.get("user_id", -1)) != caller.grocy_user_id for r in rows):
+                    raise ToolFailure("Cette transaction n'appartient pas à ce compte : annulation refusée.")
+                if not all(int(r.get("undone") or 0) for r in rows):
+                    pending.append(transaction)
+            if not pending:
                 self.store.mark_undone(last.rowid)
                 return {"statut": "deja_annule", "message": f"Cette action était déjà annulée : {last.summary}."}
-            try:
-                await client.undo(last.transaction_id)
-            except GrocyRequestError as error:
-                raise ToolFailure(f"Annulation impossible : le stock a changé depuis cette action ({clean_text(error.message, 200)}).") from None
+            for transaction in reversed(pending):
+                try:
+                    await client.undo(transaction)
+                except GrocyRequestError as error:
+                    raise ToolFailure(
+                        f"Annulation impossible : le stock a changé depuis cette action ({clean_text(error.message, 200)})."
+                    ) from None
             self.store.mark_undone(last.rowid)
             return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
 
