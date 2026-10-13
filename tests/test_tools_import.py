@@ -330,7 +330,7 @@ def test_r7_consignes_foodshiner():
     import inspect
 
     text = inspect.getsource(app.register_tools)
-    assert "ShoppingList" in text and "Europe/Zurich" in text
+    assert "ShoppingList" in text and "fuseau" in text
 
 
 async def test_m4_import_annule_peut_etre_refait(service, fake):
@@ -347,3 +347,20 @@ async def test_meme_code_deux_fois_avec_creation(service, fake):
     done = await service.importer_articles(JOHNNY, articles, jeton_confirmation=token)
     assert [line["resultat"] for line in done["lignes"]] == ["cree_et_ajoute", "ajoute"]
     assert fake.amount(fake.barcodes[COCA]) == 3 and sum(p["name"] == "Coca-Cola 33 cl" for p in fake.products.values()) == 1
+
+
+async def test_date_du_jour_ignoree_et_signalee(service, fake, clock, settings):
+    """Une sauvegarde sans date saisie donne souvent une péremption = jour du rangement : « jamais », signalé à vérifier."""
+    import datetime as dt
+    import zoneinfo
+
+    today = dt.datetime.fromtimestamp(clock(), zoneinfo.ZoneInfo(settings.timezone)).date()
+    tomorrow = (today + dt.timedelta(days=1)).isoformat()
+    articles = [
+        {"code_barres": "3017620422003", "quantite": 1, "date_peremption": today.isoformat()},
+        {"code_barres": "3017620422003", "quantite": 1, "date_peremption": tomorrow},
+    ]
+    preview = await service.importer_articles(JOHNNY, articles)
+    first, second = preview["lignes"]
+    assert first["date_peremption"] == "2999-12-31" and "vérifier" in first["avertissement"]
+    assert second["date_peremption"] == tomorrow and "avertissement" not in second

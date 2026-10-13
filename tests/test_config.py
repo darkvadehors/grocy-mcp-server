@@ -70,3 +70,10 @@ def test_list_overrides():
     s = load_settings(env(MCP_EXTRA_REDIRECT_URIS="http://localhost:6274/oauth/callback  https://x.example.test/cb"))
     assert s.extra_redirect_uris == ("http://localhost:6274/oauth/callback", "https://x.example.test/cb")
     assert load_settings(env(MCP_CIMD_HOSTS="claude.ai")).cimd_hosts == ("claude.ai",)
+
+
+def test_timezone():
+    assert load_settings(env()).timezone == "UTC"
+    assert load_settings(env(MCP_TIMEZONE="Europe/Zurich")).timezone == "Europe/Zurich"
+    with pytest.raises(ConfigError, match="MCP_TIMEZONE"):
+        load_settings(env(MCP_TIMEZONE="Mars/Olympus"))

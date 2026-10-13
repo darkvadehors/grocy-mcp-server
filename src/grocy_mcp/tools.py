@@ -10,7 +10,8 @@ import secrets
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any, NoReturn, TypeVar
 
 import anyio
@@ -843,9 +844,23 @@ class ToolService:
             when = parsed.isoformat()
         else:
             when = None
+        warning = None
+        today = datetime.fromtimestamp(self.store.now(), ZoneInfo(self.settings.timezone)).date().isoformat()
+        if when == today:
+            # FoodShiner et d'autres applications mettent la date du jour quand aucune péremption n'a été saisie
+            when = None
+            warning = "date de péremption égale au jour de l'import (souvent : aucune date saisie) : « jamais » retenu, à vérifier"
         place = clean_text(raw.get("emplacement"), MAX_NAME) if raw.get("emplacement") not in (None, "") else None
         group = clean_text(raw.get("categorie"), MAX_NAME) if raw.get("categorie") not in (None, "") else None
-        return {"code": code, "nom": nom, "quantite": _num(quantite), "date": when, "emplacement": place, "categorie": group}
+        return {
+            "code": code,
+            "nom": nom,
+            "quantite": _num(quantite),
+            "date": when,
+            "emplacement": place,
+            "categorie": group,
+            "avertissement": warning,
+        }
 
     @staticmethod
     def _by_name(rows: list[dict], name: str | None) -> dict | None:
@@ -927,6 +942,8 @@ class ToolService:
                 out.append({"ligne": number, "statut": "ignore", "raison": line["erreur"]})
                 continue
             entry = {"ligne": number, "quantite": line["quantite"], "date_peremption": line["date"] or NEVER}
+            if line.get("avertissement"):
+                entry["avertissement"] = line["avertissement"]
             step: dict = {"quantite": line["quantite"], "date": line["date"] or NEVER, "code": line["code"]}
             if line["code"] and line["code"] in seen_codes:  # même code plus haut dans la liste
                 first = plan[seen_codes[line["code"]]]

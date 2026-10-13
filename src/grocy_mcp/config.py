@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigError(Exception):
@@ -30,6 +31,7 @@ class Settings:
     cimd_hosts: tuple[str, ...] = ("claude.ai", "chatgpt.com")
     extra_redirect_uris: tuple[str, ...] = ()
     allowed_origins: tuple[str, ...] = ("https://claude.ai", "https://claude.com", "https://chatgpt.com")
+    timezone: str = "UTC"  # fuseau des personnes (dates de péremption « du jour »)
 
     @property
     def resource_url(self) -> str:
@@ -103,6 +105,14 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         raw = env.get(name, "").strip()
         if raw:
             options[field] = tuple(raw.split())
+
+    zone = env.get("MCP_TIMEZONE", "").strip()
+    if zone:
+        try:
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ConfigError("MCP_TIMEZONE : fuseau horaire inconnu") from None
+        options["timezone"] = zone
 
     return Settings(
         grocy_base_url=_bare_https(env, "GROCY_BASE_URL"),

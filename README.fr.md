@@ -68,6 +68,7 @@ Créer ensuite une clé API pour ce compte (Grocy → menu de l'utilisateur → 
 | `MCP_CIMD_HOSTS` | Hôtes autorisés pour les documents CIMD (`claude.ai chatgpt.com`) |
 | `MCP_EXTRA_REDIRECT_URIS` | URI de retour supplémentaires, séparées par des espaces |
 | `MCP_ALLOWED_ORIGINS` | Valeurs d'`Origin` autorisées sur `/mcp` |
+| `MCP_TIMEZONE` | Fuseau horaire des personnes (`UTC` par défaut), par exemple `Europe/Zurich` |
 
 Clé maître :
 

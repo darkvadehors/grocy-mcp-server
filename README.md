@@ -70,6 +70,7 @@ Then create an API key for that account (Grocy → user menu → Manage API keys
 | `MCP_CIMD_HOSTS` | Hosts allowed for CIMD documents (`claude.ai chatgpt.com`) |
 | `MCP_EXTRA_REDIRECT_URIS` | Additional redirect URIs, space separated |
 | `MCP_ALLOWED_ORIGINS` | Allowed `Origin` values on `/mcp` |
+| `MCP_TIMEZONE` | Time zone of the people (default `UTC`), e.g. `Europe/Zurich` |
 
 Master key:
 
