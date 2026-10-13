@@ -190,3 +190,61 @@ async def test_ajouter_manquants_recette(service, fake):
     await service.ajouter_manquants_liste(JOHNNY, jeton_confirmation=preview["jeton_confirmation"])
     assert posts(fake) == ["/api/recipes/1/add-not-fulfilled-products-to-shoppinglist"]
     assert (await service.ajouter_manquants_liste(JOHNNY, recette="gratin"))["statut"] == "introuvable"
+
+
+async def test_idempotence_concurrent_replay(service, fake, monkeypatch):
+    """Le même message rejoué pendant que le premier attend encore Grocy n'enregistre qu'un achat."""
+    import anyio
+    import httpx2
+
+    inner = fake.transport()
+
+    class Slow(httpx2.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            await anyio.sleep(0.01)  # Grocy lent : l'autre appel s'exécute pendant l'attente
+            return await inner.handle_async_request(request)
+
+    monkeypatch.setattr(fake, "transport", lambda: Slow())
+    results = []
+
+    async def buy():
+        results.append(await service.enregistrer_achat(JOHNNY, "lait", 1))
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(buy)
+        tg.start_soon(buy)
+    assert fake.amount(1) == 3
+    assert sorted(r["statut"] for r in results) == ["en_cours", "ok"]
+
+
+async def test_idempotence_after_timeout_following_write(service, fake):
+    """Grocy enregistre l'achat mais la réponse se perd : le renvoi ne doit pas acheter une seconde fois."""
+    fake.timeout_after_next_write = True
+    with pytest.raises(ToolFailure):
+        await service.enregistrer_achat(JOHNNY, "lait", 1)
+    assert fake.amount(1) == 3
+    again = await service.enregistrer_achat(JOHNNY, "lait", 1)
+    assert again["statut"] == "incertain" and fake.amount(1) == 3
+    assert (await service.enregistrer_achat(JOHNNY, "lait", 1, cle_idempotence="verifie"))["statut"] == "ok"
+
+
+async def test_idempotence_released_when_nothing_written(service, fake):
+    """Une action refusée avant toute écriture (produit inconnu) peut être relancée telle quelle."""
+    assert (await service.enregistrer_achat(JOHNNY, "riz", 1))["statut"] in ("introuvable", "ambigu")
+    fake.products[6] = {"id": 6, "name": "Riz basmati", "location_id": 2, "qu_id_stock": 1, "active": 1}
+    assert (await service.enregistrer_achat(JOHNNY, "riz", 1))["statut"] == "ok"
+
+
+async def test_partial_match_inside_word_never_writes(service, fake):
+    """« riz » ne doit pas désigner « Chorizo » : une correspondance au milieu d'un mot n'est qu'une suggestion."""
+    fake.products[6] = {"id": 6, "name": "Chorizo", "location_id": 2, "qu_id_stock": 1, "active": 1}
+    out = await service.enregistrer_achat(JOHNNY, "riz", 1)
+    assert out["statut"] == "ambigu" and [c["id"] for c in out["candidats"]] == [6]
+    assert posts(fake) == []
+
+
+async def test_product_named_with_digits_wins_over_identifier(service, fake):
+    fake.products[7] = {"id": 7, "name": "1664", "location_id": 2, "qu_id_stock": 1, "active": 1}
+    fake.products[1664] = {"id": 1664, "name": "Autre", "location_id": 2, "qu_id_stock": 1, "active": 1}
+    out = await service.ajouter_liste_courses(JOHNNY, "1664", 1)
+    assert out["statut"] == "ok" and fake.shopping[0]["product_id"] == 7

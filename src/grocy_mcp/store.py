@@ -320,6 +320,27 @@ class Store:
         )
         return row[0] if row else None
 
+    def reserve_idempotent(self, grocy_user_id: int, key: str, max_age: float, marker: str) -> str | None:
+        """Réserve la clé de façon atomique. Renvoie None si la réservation est acquise, sinon la valeur existante."""
+        with self._lock:  # une seule connexion protégée par le verrou : la séquence est atomique dans le service
+            self._db.execute(
+                "DELETE FROM idempotency WHERE grocy_user_id = ? AND key = ? AND created_at < ?",
+                (grocy_user_id, key, self.now() - max_age),
+            )
+            inserted = self._db.execute(
+                "INSERT INTO idempotency(grocy_user_id, key, result, created_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(grocy_user_id, key) DO NOTHING",
+                (grocy_user_id, key, marker, self.now()),
+            ).rowcount
+            if inserted == 1:
+                return None
+            return self._db.execute(
+                "SELECT result FROM idempotency WHERE grocy_user_id = ? AND key = ?", (grocy_user_id, key)
+            ).fetchone()[0]
+
+    def release_idempotent(self, grocy_user_id: int, key: str) -> None:
+        self._exec("DELETE FROM idempotency WHERE grocy_user_id = ? AND key = ?", (grocy_user_id, key))
+
     def save_idempotent(self, grocy_user_id: int, key: str, result_json: str) -> None:
         self._exec(
             "INSERT INTO idempotency(grocy_user_id, key, result, created_at) VALUES(?, ?, ?, ?) "

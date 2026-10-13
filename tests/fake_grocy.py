@@ -72,6 +72,7 @@ class FakeGrocy:
         self.shopping: list[dict] = []
         self.calls: list[tuple[str, str]] = []
         self.next_failure: int | str | None = None
+        self.timeout_after_next_write = False  # Grocy enregistre l'écriture puis la réponse se perd
         self._ids = itertools.count(100)
         self._tx = itertools.count(1)
         self._snapshots: dict[str, tuple[list[dict], list[dict], set[int]]] = {}
@@ -105,6 +106,13 @@ class FakeGrocy:
 
     # --- routeur ----------------------------------------------------------------------------------
     def handle(self, request: httpx2.Request) -> httpx2.Response:
+        response = self._handle(request)
+        if self.timeout_after_next_write and request.method == "POST":
+            self.timeout_after_next_write = False
+            raise httpx2.ReadTimeout("délai dépassé après l'écriture", request=request)
+        return response
+
+    def _handle(self, request: httpx2.Request) -> httpx2.Response:
         self.calls.append((request.method, request.url.path))
         if self.next_failure is not None:
             failure, self.next_failure = self.next_failure, None

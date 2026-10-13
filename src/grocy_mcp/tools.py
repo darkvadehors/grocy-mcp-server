@@ -34,6 +34,8 @@ IDEMPOTENCY_TTL = 600
 UNDO_WINDOW = 86_400
 _BARCODE = re.compile(r"[0-9]{8,14}")
 _PRODUCT_ID = re.compile(r"#?[0-9]{1,7}")
+_PENDING = "__en_cours__"
+_UNCERTAIN = "__incertain__"
 UNAVAILABLE = "Grocy ne répond pas pour le moment. Réessayez dans quelques instants."
 
 
@@ -68,6 +70,11 @@ def _num(value: object) -> float | int:
 
 def _product_ref(product: dict) -> dict:
     return {"id": int(product["id"]), "nom": clean_text(product.get("name"))}
+
+
+def _whole_words(wanted: str, name: str) -> bool:
+    """Vrai si `wanted` apparaît dans `name` en mots entiers (« yaourt » dans « yaourt nature », pas « riz » dans « chorizo »)."""
+    return bool(wanted) and re.search(rf"(?<!\w){re.escape(wanted)}(?!\w)", name) is not None
 
 
 def _is_normal_recipe(recipe: dict) -> bool:
@@ -150,17 +157,19 @@ class ToolService:
             details = await client.product_by_barcode(text)
             return ("ok", details["product"]) if details else ("introuvable", None)
         products = [p for p in await client.products() if int(p.get("active", 1)) == 1]
-        if _PRODUCT_ID.fullmatch(text):
+        wanted = fold(text)
+        exact = [p for p in products if fold(str(p["name"])) == wanted]
+        if not exact and _PRODUCT_ID.fullmatch(text):  # un produit nommé « 1664 » l'emporte sur l'identifiant 1664
             wanted_id = int(text.lstrip("#"))
             match = [p for p in products if int(p["id"]) == wanted_id]
             return ("ok", match[0]) if match else ("introuvable", None)
-        wanted = fold(text)
-        exact = [p for p in products if fold(str(p["name"])) == wanted]
-        matches = exact or [p for p in products if wanted in fold(str(p["name"]))]
+        matches = exact or [p for p in products if _whole_words(wanted, fold(str(p["name"])))]
         if len(matches) == 1:
             return "ok", matches[0]
         if not matches:
-            return "introuvable", None
+            # une correspondance au milieu d'un mot (« riz » dans « Chorizo ») n'est qu'une suggestion, jamais une cible
+            partial = [p for p in products if wanted in fold(str(p["name"]))]
+            return ("ambigu", partial[:MAX_RESULTS]) if partial else ("introuvable", None)
         return "ambigu", matches[:MAX_RESULTS]
 
     @staticmethod
@@ -177,7 +186,7 @@ class ToolService:
     def _pick(items: list[dict], name: str) -> list[dict]:
         wanted = fold(clean_text(name))
         exact = [i for i in items if fold(str(i["name"])) == wanted]
-        return exact or [i for i in items if wanted and wanted in fold(str(i["name"]))]
+        return exact or [i for i in items if wanted and _whole_words(wanted, fold(str(i["name"])))]
 
     def _match_location(self, locations: list[dict], name: str) -> dict:
         matches = self._pick(locations, name)
@@ -400,7 +409,19 @@ class ToolService:
         canonical = json.dumps([tool, args], sort_keys=True, ensure_ascii=False)
         key = clean_text(cle, 100) if cle else hashlib.sha256(canonical.encode()).hexdigest()
         slot = f"{tool}:{key}"
-        previous = self.store.get_idempotent(caller.grocy_user_id, slot, IDEMPOTENCY_TTL)
+        previous = self.store.reserve_idempotent(caller.grocy_user_id, slot, IDEMPOTENCY_TTL, _PENDING)
+        if previous == _PENDING:
+            return {
+                "statut": "en_cours",
+                "message": "Une action identique est déjà en cours : elle n'est pas lancée une seconde fois.",
+            }
+        if previous == _UNCERTAIN:
+            return {
+                "statut": "incertain",
+                "message": "Une action identique a été envoyée il y a moins de 10 minutes mais Grocy n'a pas répondu : "
+                "elle a peut-être été enregistrée. Vérifiez (voir_produit, voir_liste_courses) avant de recommencer ; "
+                "pour la refaire volontairement, fournissez une nouvelle cle_idempotence.",
+            }
         if previous is not None:
             earlier = json.loads(previous)
             return {
@@ -409,9 +430,22 @@ class ToolService:
                 "message": "Action identique déjà exécutée il y a moins de 10 minutes, non répétée "
                 f"({earlier.get('message', '')}). Pour la refaire volontairement, fournissez une nouvelle cle_idempotence.",
             }
-        result = await self._execute(caller, tool, args, run)
+        try:
+            result = await self._execute(caller, tool, args, run)
+        except ToolFailure as failure:
+            if str(failure) == UNAVAILABLE:
+                # Grocy a pu enregistrer l'écriture avant que la réponse ne se perde : ne pas la rejouer à l'aveugle
+                self.store.save_idempotent(caller.grocy_user_id, slot, _UNCERTAIN)
+            else:
+                self.store.release_idempotent(caller.grocy_user_id, slot)
+            raise
+        except BaseException:
+            self.store.release_idempotent(caller.grocy_user_id, slot)
+            raise
         if result.get("statut") == "ok":
             self.store.save_idempotent(caller.grocy_user_id, slot, json.dumps(result, ensure_ascii=False))
+        else:
+            self.store.release_idempotent(caller.grocy_user_id, slot)
         return result
 
     def _stock_done(self, caller: Caller, tool: str, rows: list[dict] | None, summary: str) -> dict:
