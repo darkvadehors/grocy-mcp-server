@@ -103,8 +103,11 @@ async def test_register_quota_and_purge(settings, store, audit, cimd, clock):
     await p.register_client(client_info(cid="b"))
     with pytest.raises(RegistrationError, match="trop de clients"):
         await p.register_client(client_info(cid="c"))
-    clock.advance(DAY + 1)
-    await p.register_client(client_info(cid="c"))  # a et b, jamais utilisés, sont purgés
+    clock.advance(1800)
+    with pytest.raises(RegistrationError, match="trop de clients"):
+        await p.register_client(client_info(cid="c"))
+    clock.advance(1801)
+    await p.register_client(client_info(cid="c"))  # a et b, jamais utilisés depuis plus d'une heure, sont purgés
 
 
 async def test_authorize_creates_pending(provider, store):

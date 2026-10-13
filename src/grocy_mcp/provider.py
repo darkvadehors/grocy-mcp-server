@@ -32,7 +32,7 @@ ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 86_400
 LOOPBACK_REFRESH_TTL = 7 * 86_400
 ABSOLUTE_TTL = 90 * 86_400
-UNUSED_CLIENT_TTL = 86_400
+UNUSED_CLIENT_TTL = 3_600  # enregistrement jamais suivi d'une connexion : place libérée après 1 h
 CIMD_CACHE_TTL = 86_400
 
 
