@@ -1,0 +1,1 @@
+# grocy-mcp-server

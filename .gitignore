@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.egg-info/
+*.db
+*.db-*
+*.jsonl
+.secrets/
+.DS_Store
