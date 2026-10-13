@@ -146,3 +146,30 @@ async def test_create_objects_and_product_groups(fake):
 async def test_create_object_closed_list(fake):
     with pytest.raises(ValueError):
         await client(fake).create_object("users", {"username": "x"})
+
+
+async def test_userfields_lecture_ecriture(fake):
+    c = client(fake)
+    assert await c.userfields(1) == {}
+    await c.set_userfields(1, {"nutri_kcal_100g": 47, "nutri_source": "Ciqual 19041"})
+    assert (await c.userfields(1))["nutri_kcal_100g"] == "47"  # Grocy stocke les valeurs en texte
+    products = {p["id"]: p for p in await c.products()}
+    assert products[1]["userfields"]["nutri_source"] == "Ciqual 19041"
+    with pytest.raises(GrocyRequestError):
+        await c.set_userfields(1, {"champ_inconnu": 1})
+
+
+async def test_userfields_ecriture_exige_master_data_edit(fake):
+    fake.users[KEY_JOHNNY_IA].permissions.discard("MASTER_DATA_EDIT")
+    assert await client(fake).userfields(1) == {}  # lecture sans permission
+    with pytest.raises(GrocyForbidden):
+        await client(fake).set_userfields(1, {"nutri_kcal_100g": 47})
+
+
+async def test_calories_seul_champ_modifiable(fake):
+    c = client(fake)
+    await c.set_product_calories(1, 470.25)
+    assert fake.products[1]["calories"] == 470.25 and fake.products[1]["name"] == "Lait demi-écrémé"
+    assert [m for m, p in fake.paths() if p == "/api/objects/products/1"] == ["PUT"]
+    with pytest.raises(ValueError):
+        await c.set_product_calories(1, -5)

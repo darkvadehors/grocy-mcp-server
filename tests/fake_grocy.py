@@ -64,6 +64,13 @@ class FakeGrocy:
         self.locations = [{"id": 1, "name": "Frigo"}, {"id": 2, "name": "Placard"}]
         self.quantity_units = [{"id": 1, "name": "Pièce", "name_plural": "Pièces"}]
         self.product_groups: list[dict] = []
+        # Champs personnalisés des produits (créés en production par grocy_nutrition_fields.py)
+        self.userfield_names = {
+            "nutri_kcal_100g", "nutri_proteines_100g", "nutri_glucides_100g", "nutri_sucres_100g", "nutri_lipides_100g",
+            "nutri_ags_100g", "nutri_fibres_100g", "nutri_sel_100g", "nutri_poids_unite_g", "nutri_source",
+            "nutri_non_alimentaire",
+        }
+        self.userfield_values: dict[int, dict[str, str]] = {}
         self.lookup_db: dict[str, dict] = {}  # code-barres → proposition du plugin multi-sources
         self.lookups: list[tuple[str, bool]] = []  # (code, add) dans l'ordre des appels
         self.recipes = [{"id": 1, "name": "Crêpes"}]
@@ -128,7 +135,7 @@ class FakeGrocy:
             return httpx2.Response(401)
         path, method = request.url.path, request.method
         body: dict = {}
-        if method == "POST" and not path.endswith("/undo"):
+        if method in ("POST", "PUT") and not path.endswith("/undo"):
             if request.headers.get("content-type") != "application/json":
                 return _err(400, "Bad Content-Type")
             body = json.loads(request.content or b"{}")
@@ -145,6 +152,9 @@ class FakeGrocy:
             (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups)", "GET", self._objects),
             (r"/api/objects/(products|product_barcodes|locations|product_groups)", "POST", self._create_object),
             (r"/api/stock/barcodes/external-lookup/([^/]+)", "GET", self._external_lookup),
+            (r"/api/userfields/products/(\d+)", "GET", self._get_userfields),
+            (r"/api/userfields/products/(\d+)", "PUT", self._put_userfields),
+            (r"/api/objects/products/(\d+)", "PUT", self._put_product),
             (r"/api/stock", "GET", self._stock),
             (r"/api/stock/volatile", "GET", self._volatile),
             (r"/api/stock/products/by-barcode/([^/]+)", "GET", self._by_barcode),
@@ -170,7 +180,7 @@ class FakeGrocy:
 
     def _objects(self, user, request, body, entity):
         data = {
-            "products": list(self.products.values()),
+            "products": [{**p, "userfields": self._userfields_of(p["id"])} for p in self.products.values()],
             "shopping_list": self.shopping,
             "locations": self.locations,
             "quantity_units": self.quantity_units,
@@ -178,6 +188,32 @@ class FakeGrocy:
             "product_groups": self.product_groups,
         }[entity]
         return httpx2.Response(200, json=data)
+
+    # --- champs personnalisés (Grocy 4.7.1 : valeurs en texte ; lecture sans permission) -------------
+    def _userfields_of(self, product_id: int) -> dict:
+        values = self.userfield_values.get(int(product_id), {})
+        return {name: values.get(name) for name in sorted(self.userfield_names)}
+
+    def _get_userfields(self, user, request, body, product_id):
+        return httpx2.Response(200, json=self._userfields_of(int(product_id)))
+
+    def _put_userfields(self, user, request, body, product_id):
+        if not user.can("MASTER_DATA_EDIT"):
+            return _err(403, "Permission missing: MASTER_DATA_EDIT")
+        unknown = set(body) - self.userfield_names
+        if unknown:
+            return _err(400, f"Field {sorted(unknown)[0]} is not a valid userfield of the given entity")
+        values = self.userfield_values.setdefault(int(product_id), {})
+        values.update({k: (None if v is None else str(v)) for k, v in body.items()})
+        return httpx2.Response(204)
+
+    def _put_product(self, user, request, body, product_id):
+        if not user.can("MASTER_DATA_EDIT"):
+            return _err(403, "Permission missing: MASTER_DATA_EDIT")
+        if int(product_id) not in self.products:
+            return _err(400, "Object not found")
+        self.products[int(product_id)].update(body)
+        return httpx2.Response(204)
 
     # --- données de base (Grocy 4.7.1 : MASTER_DATA_EDIT, noms uniques) ---------------------------
     def _insert(self, entity: str, data: dict) -> tuple[int | None, httpx2.Response | None]:

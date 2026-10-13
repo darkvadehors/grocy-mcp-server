@@ -156,6 +156,21 @@ class GrocyClient:
             created = int(created)
         return _int_id(created)
 
+    # --- champs personnalisés et énergie (apports nutritionnels, spec B) ---------------------------
+    async def userfields(self, product_id: int) -> dict:
+        """Champs personnalisés renseignés d'un produit (les champs vides sont omis ; valeurs en texte)."""
+        result = await self._request("GET", f"/api/userfields/products/{_int_id(product_id)}")
+        return {k: v for k, v in (result or {}).items() if v not in (None, "")} if isinstance(result, dict) else {}
+
+    async def set_userfields(self, product_id: int, values: dict) -> None:
+        await self._request("PUT", f"/api/userfields/products/{_int_id(product_id)}", body=values)
+
+    async def set_product_calories(self, product_id: int, kcal: float) -> None:
+        """Seule modification d'objet du serveur : le champ natif « Énergie » (kcal par unité de stock)."""
+        if not isinstance(kcal, int | float) or isinstance(kcal, bool) or not 0 <= kcal <= 1_000_000:
+            raise ValueError("énergie invalide")
+        await self._request("PUT", f"/api/objects/products/{_int_id(product_id)}", body={"calories": round(float(kcal), 2)})
+
     # --- lectures --------------------------------------------------------------------------------
     async def products(self) -> list[dict]:
         return await self._request("GET", "/api/objects/products")
