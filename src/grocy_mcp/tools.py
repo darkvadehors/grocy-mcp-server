@@ -74,6 +74,19 @@ def _is_normal_recipe(recipe: dict) -> bool:
     return recipe.get("type", "normal") == "normal"
 
 
+
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+MAX_PRICE = 10_000
+MAX_INVENTORY = 10_000
+
+
+def _fmt(value: float) -> str:
+    return str(_num(value)).replace(".", ",")
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
 class ToolService:
     def __init__(
         self,
@@ -323,3 +336,338 @@ class ToolService:
             }
 
         return await self._grocy(caller, run)
+
+    # --- garde-fous communs aux actions --------------------------------------------------------------
+    def _quantity(self, value: object, name: str = "quantite") -> float:
+        if not _is_number(value) or value <= 0:  # type: ignore[operator]
+            raise ToolFailure(f"{name} doit être un nombre strictement positif.")
+        if value > self.settings.max_quantity:  # type: ignore[operator]
+            raise ToolFailure(f"{name} est limitée à {self.settings.max_quantity} par action ; au-delà, passez par Grocy.")
+        return float(value)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _price(value: object) -> float | None:
+        if value is None:
+            return None
+        if not _is_number(value) or not 0 <= value <= MAX_PRICE:  # type: ignore[operator]
+            raise ToolFailure(f"prix doit être un nombre entre 0 et {MAX_PRICE}.")
+        return float(value)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _date(value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = clean_text(value, 10)
+        try:
+            parsed = date.fromisoformat(text) if _ISO_DATE.fullmatch(text) else None
+        except ValueError:
+            parsed = None
+        if parsed is None or not 2000 <= parsed.year <= 2999:
+            raise ToolFailure("peremption doit être une date au format AAAA-MM-JJ.")
+        return parsed.isoformat()
+
+    def _consume_quota(self, caller: Caller) -> None:
+        now, uid = self.store.now(), caller.grocy_user_id
+        if self.store.count_actions(uid, now - 60) >= self.settings.actions_per_minute:
+            raise ToolFailure(
+                f"Limite de {self.settings.actions_per_minute} actions par minute atteinte. Réessayez dans une minute."
+            )
+        if self.store.count_actions(uid, now - 3600) >= self.settings.actions_per_hour:
+            raise ToolFailure(f"Limite de {self.settings.actions_per_hour} actions par heure atteinte. Réessayez plus tard.")
+        self.store.record_action(uid)
+
+    async def _execute(
+        self, caller: Caller, tool: str, args: dict, run: Callable[[GrocyClient], Awaitable[dict]]
+    ) -> dict:
+        self._consume_quota(caller)
+        base = {"compte_id": caller.grocy_user_id, "client": caller.client_id, "outil": tool, "parametres": args}
+        try:
+            result = await self._grocy(caller, run)
+        except ToolFailure as failure:
+            self.audit.write("action", **base, statut="erreur", erreur=str(failure))
+            raise
+        self.audit.write("action", **base, statut=result.get("statut"), transaction=result.get("transaction_id"))
+        return result
+
+    async def _action(
+        self,
+        caller: Caller,
+        tool: str,
+        args: dict,
+        cle: str | None,
+        run: Callable[[GrocyClient], Awaitable[dict]],
+    ) -> dict:
+        canonical = json.dumps([tool, args], sort_keys=True, ensure_ascii=False)
+        key = clean_text(cle, 100) if cle else hashlib.sha256(canonical.encode()).hexdigest()
+        slot = f"{tool}:{key}"
+        previous = self.store.get_idempotent(caller.grocy_user_id, slot, IDEMPOTENCY_TTL)
+        if previous is not None:
+            earlier = json.loads(previous)
+            return {
+                **earlier,
+                "deja_execute": True,
+                "message": "Action identique déjà exécutée il y a moins de 10 minutes, non répétée "
+                f"({earlier.get('message', '')}). Pour la refaire volontairement, fournissez une nouvelle cle_idempotence.",
+            }
+        result = await self._execute(caller, tool, args, run)
+        if result.get("statut") == "ok":
+            self.store.save_idempotent(caller.grocy_user_id, slot, json.dumps(result, ensure_ascii=False))
+        return result
+
+    def _stock_done(self, caller: Caller, tool: str, rows: list[dict] | None, summary: str) -> dict:
+        transaction = str(rows[0]["transaction_id"]) if rows else None
+        if transaction:
+            self.store.record_undo(caller.grocy_user_id, transaction, tool, summary)
+        return {
+            "statut": "ok",
+            "message": summary[:1].upper() + summary[1:] + ".",
+            "transaction_id": transaction,
+            "annulable": transaction is not None,
+        }
+
+    def _new_confirmation(self, caller: Caller, tool: str, payload: dict) -> str:
+        token = secrets.token_urlsafe(16)
+        self.store.save_confirmation(
+            sha256_hex(token), caller.grocy_user_id, tool, json.dumps(payload), self.store.now() + CONFIRMATION_TTL
+        )
+        return token
+
+    def _take_confirmation(self, caller: Caller, tool: str, token: str) -> dict:
+        payload = self.store.pop_confirmation(sha256_hex(clean_text(token, 100)), caller.grocy_user_id, tool)
+        if payload is None:
+            raise ToolFailure("Jeton de confirmation invalide, déjà utilisé ou expiré (5 minutes). Redemandez un aperçu.")
+        return json.loads(payload)
+
+    # --- liste de courses ----------------------------------------------------------------------------
+    async def ajouter_liste_courses(
+        self, caller: Caller, produit: str, quantite: float = 1, note: str | None = None, cle_idempotence: str | None = None
+    ) -> dict:
+        amount = self._quantity(quantite)
+        note_text = clean_text(note, 200) or None
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            await client.add_to_shopping_list(int(found["id"]), amount, note_text)
+            return {
+                "statut": "ok",
+                "message": f"{_fmt(amount)} × {clean_text(found['name'])} ajouté à la liste de courses.",
+                "produit": _product_ref(found),
+            }
+
+        args = {"produit": clean_text(produit), "quantite": amount, "note": note_text}
+        return await self._action(caller, "ajouter_liste_courses", args, cle_idempotence, run)
+
+    async def retirer_liste_courses(
+        self, caller: Caller, produit: str, quantite: float = 1, cle_idempotence: str | None = None
+    ) -> dict:
+        amount = self._quantity(quantite)
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            product_id = int(found["id"])
+            listed = [
+                i for i in await client.shopping_list() if i.get("product_id") is not None and int(i["product_id"]) == product_id
+            ]
+            if not listed:
+                return {"statut": "absent", "message": f"{clean_text(found['name'])} n'est pas sur la liste de courses."}
+            await client.remove_from_shopping_list(product_id, amount)
+            return {
+                "statut": "ok",
+                "message": f"{_fmt(amount)} × {clean_text(found['name'])} retiré de la liste de courses.",
+                "produit": _product_ref(found),
+            }
+
+        args = {"produit": clean_text(produit), "quantite": amount}
+        return await self._action(caller, "retirer_liste_courses", args, cle_idempotence, run)
+
+    async def ajouter_manquants_liste(
+        self, caller: Caller, recette: str | None = None, jeton_confirmation: str | None = None
+    ) -> dict:
+        tool = "ajouter_manquants_liste"
+        if jeton_confirmation:
+            data = self._take_confirmation(caller, tool, jeton_confirmation)
+
+            async def confirmed(client: GrocyClient) -> dict:
+                if data["recette_id"] is None:
+                    await client.add_missing_products()
+                else:
+                    await client.add_recipe_missing_products(int(data["recette_id"]))
+                return {"statut": "ok", "message": "Produits manquants ajoutés à la liste de courses."}
+
+            return await self._execute(caller, tool, {"recette_id": data["recette_id"], "confirmation": True}, confirmed)
+
+        async def preview(client: GrocyClient) -> dict:
+            if recette:
+                recipes = [r for r in await client.recipes() if _is_normal_recipe(r)]
+                matches = self._pick(recipes, recette)
+                if len(matches) != 1:
+                    if not matches:
+                        return {"statut": "introuvable", "message": f"Aucune recette ne correspond à « {clean_text(recette)} »."}
+                    return {
+                        "statut": "ambigu",
+                        "message": "Plusieurs recettes correspondent : précisez.",
+                        "candidats": [{"id": int(r["id"]), "nom": clean_text(r["name"])} for r in matches[:MAX_RESULTS]],
+                    }
+                recipe_id = int(matches[0]["id"])
+                state = next((f for f in await client.recipes_fulfillment() if int(f["recipe_id"]) == recipe_id), {})
+                count = int(state.get("missing_products_count") or 0)
+                if count == 0:
+                    return {"statut": "rien_a_ajouter", "message": "Tous les ingrédients de cette recette sont en stock."}
+                apercu: dict = {
+                    "recette": clean_text(matches[0]["name"]),
+                    "produits_manquants": count,
+                    "ingredients": clean_text(state.get("product_names_comma_separated"), 500) or None,
+                }
+                payload = {"recette_id": recipe_id}
+            else:
+                missing = (await client.volatile(5)).get("missing_products") or []
+                if not missing:
+                    return {"statut": "rien_a_ajouter", "message": "Aucun produit n'est sous son stock minimum."}
+                apercu = {"produits": [{"nom": clean_text(m.get("name")), "quantite": _num(m.get("amount_missing"))} for m in missing]}
+                payload = {"recette_id": None}
+            return {
+                "statut": "confirmation_requise",
+                "message": "Aperçu : rien n'a encore été ajouté. Montrez cet aperçu à la personne, puis rappelez "
+                "ajouter_manquants_liste avec jeton_confirmation pour confirmer.",
+                "apercu": apercu,
+                "jeton_confirmation": self._new_confirmation(caller, tool, payload),
+            }
+
+        return await self._grocy(caller, preview)
+
+    # --- stock ---------------------------------------------------------------------------------------
+    async def enregistrer_achat(
+        self,
+        caller: Caller,
+        produit: str,
+        quantite: float,
+        prix: float | None = None,
+        peremption: str | None = None,
+        emplacement: str | None = None,
+        cle_idempotence: str | None = None,
+    ) -> dict:
+        amount, price, best_before = self._quantity(quantite), self._price(prix), self._date(peremption)
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            location = await self._find_location(client, emplacement) if emplacement else None
+            rows = await client.purchase(
+                int(found["id"]), amount, price=price, best_before_date=best_before,
+                location_id=int(location["id"]) if location else None,
+            )
+            return self._stock_done(caller, "enregistrer_achat", rows, f"achat de {_fmt(amount)} × {clean_text(found['name'])} enregistré")
+
+        args = {"produit": clean_text(produit), "quantite": amount, "prix": price, "peremption": best_before, "emplacement": clean_text(emplacement) or None}
+        return await self._action(caller, "enregistrer_achat", args, cle_idempotence, run)
+
+    async def consommer(
+        self, caller: Caller, produit: str, quantite: float, jete: bool = False, cle_idempotence: str | None = None
+    ) -> dict:
+        amount, spoiled = self._quantity(quantite), bool(jete)
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            rows = await client.consume(int(found["id"]), amount, spoiled=spoiled)
+            verb = "jeté" if spoiled else "consommé"
+            return self._stock_done(caller, "consommer", rows, f"{_fmt(amount)} × {clean_text(found['name'])} {verb}")
+
+        args = {"produit": clean_text(produit), "quantite": amount, "jete": spoiled}
+        return await self._action(caller, "consommer", args, cle_idempotence, run)
+
+    async def ouvrir(self, caller: Caller, produit: str, quantite: float = 1, cle_idempotence: str | None = None) -> dict:
+        amount = self._quantity(quantite)
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            rows = await client.open_product(int(found["id"]), amount)
+            return self._stock_done(caller, "ouvrir", rows, f"{_fmt(amount)} × {clean_text(found['name'])} marqué ouvert")
+
+        return await self._action(caller, "ouvrir", {"produit": clean_text(produit), "quantite": amount}, cle_idempotence, run)
+
+    async def deplacer(
+        self, caller: Caller, produit: str, quantite: float, de: str, vers: str, cle_idempotence: str | None = None
+    ) -> dict:
+        amount = self._quantity(quantite)
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            locations = await client.locations()
+            source, target = self._match_location(locations, de), self._match_location(locations, vers)
+            if int(source["id"]) == int(target["id"]):
+                raise ToolFailure("Les emplacements de départ et d'arrivée sont identiques.")
+            rows = await client.transfer(int(found["id"]), amount, int(source["id"]), int(target["id"]))
+            summary = f"{_fmt(amount)} × {clean_text(found['name'])} déplacé de {clean_text(source['name'])} vers {clean_text(target['name'])}"
+            return self._stock_done(caller, "deplacer", rows, summary)
+
+        args = {"produit": clean_text(produit), "quantite": amount, "de": clean_text(de), "vers": clean_text(vers)}
+        return await self._action(caller, "deplacer", args, cle_idempotence, run)
+
+    async def corriger_inventaire(
+        self,
+        caller: Caller,
+        produit: str,
+        nouvelle_quantite: float,
+        jeton_confirmation: str | None = None,
+        cle_idempotence: str | None = None,
+    ) -> dict:
+        tool = "corriger_inventaire"
+        if jeton_confirmation:
+            data = self._take_confirmation(caller, tool, jeton_confirmation)
+
+            async def confirmed(client: GrocyClient) -> dict:
+                details = await client.product_details(int(data["product_id"]))
+                if abs(float(details.get("stock_amount") or 0) - data["actuel"]) > 1e-9:
+                    raise ToolFailure("Le stock de ce produit a changé depuis l'aperçu : redemandez un aperçu.")
+                rows = await client.inventory(int(data["product_id"]), data["nouveau"])
+                summary = f"inventaire de {data['nom']} corrigé : {_fmt(data['actuel'])} → {_fmt(data['nouveau'])}"
+                return self._stock_done(caller, tool, rows, summary)
+
+            args = {"produit_id": data["product_id"], "nouveau": data["nouveau"], "confirmation": True}
+            return await self._execute(caller, tool, args, confirmed)
+
+        if not _is_number(nouvelle_quantite) or not 0 <= nouvelle_quantite <= MAX_INVENTORY:  # type: ignore[operator]
+            raise ToolFailure(f"nouvelle_quantite doit être un nombre entre 0 et {MAX_INVENTORY}.")
+        new = float(nouvelle_quantite)  # type: ignore[arg-type]
+
+        async def run(client: GrocyClient) -> dict:
+            status, found = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, found, produit)
+            product_id, name = int(found["id"]), clean_text(found["name"])
+            current = float((await client.product_details(product_id)).get("stock_amount") or 0)
+            if abs(new - current) < 1e-9:
+                return {"statut": "deja_a_jour", "message": f"{name} est déjà à {_fmt(new)} : rien à corriger."}
+            gap = abs(new - current)
+            if gap > self.settings.max_quantity:
+                raise ToolFailure(
+                    f"Écart de {_fmt(gap)} supérieur à la limite de {self.settings.max_quantity} par action : corrigez dans Grocy."
+                )
+            if (
+                gap > self.settings.inventory_abs_threshold
+                or current == 0
+                or gap * 100 > self.settings.inventory_pct_threshold * current
+            ):
+                payload = {"product_id": product_id, "nom": name, "actuel": current, "nouveau": new}
+                return {
+                    "statut": "confirmation_requise",
+                    "message": "Écart important : rien n'a été modifié. Montrez cet aperçu à la personne, puis rappelez "
+                    "corriger_inventaire avec jeton_confirmation pour confirmer.",
+                    "apercu": {"produit": name, "actuel": _num(current), "nouveau": _num(new), "ecart": _num(new - current)},
+                    "jeton_confirmation": self._new_confirmation(caller, tool, payload),
+                }
+            rows = await client.inventory(product_id, new)
+            return self._stock_done(caller, tool, rows, f"inventaire de {name} corrigé : {_fmt(current)} → {_fmt(new)}")
+
+        return await self._action(caller, tool, {"produit": clean_text(produit), "nouveau": new}, cle_idempotence, run)
