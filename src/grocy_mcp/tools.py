@@ -29,6 +29,7 @@ from grocy_mcp.store import Store, sha256_hex
 T = TypeVar("T")
 MAX_TEXT = 120
 MAX_RESULTS = 25
+MAX_NAME = 60
 CONFIRMATION_TTL = 300
 IDEMPOTENCY_TTL = 600
 UNDO_WINDOW = 86_400
@@ -339,9 +340,11 @@ class ToolService:
         async def run(client: GrocyClient) -> dict:
             locations = await client.locations()
             units = await client.quantity_units()
+            groups = await client.product_groups()
             return {
                 "emplacements": [clean_text(loc["name"]) for loc in locations],
                 "unites": [clean_text(u["name"]) for u in units],
+                "categories": [clean_text(g["name"]) for g in groups],
             }
 
         return await self._grocy(caller, run)
@@ -750,3 +753,44 @@ class ToolService:
             return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
 
         return await self._execute(caller, "annuler_derniere_action", {"transaction": last.transaction_id}, run)
+
+    # --- données de base : création seulement (aucun outil ne modifie ni ne supprime) -----------------
+    @staticmethod
+    def _master_name(nom: object) -> str:
+        if not isinstance(nom, str):
+            raise ToolFailure("Le nom doit être un texte.")
+        text = clean_text(nom, 200).strip()
+        if not text or len(text) > MAX_NAME:
+            raise ToolFailure(f"Le nom doit contenir de 1 à {MAX_NAME} caractères.")
+        return text
+
+    async def _create_master(
+        self, caller: Caller, tool: str, entity: str, label: str, nom: str, extra: dict, cle: str | None
+    ) -> dict:
+        name = self._master_name(nom)
+
+        async def run(client: GrocyClient) -> dict:
+            rows = await (client.locations() if entity == "locations" else client.product_groups())
+            same = [r for r in rows if fold(str(r["name"])) == fold(name)]
+            if same:
+                return {
+                    "statut": "existe_deja",
+                    "cree": False,
+                    "id": int(same[0]["id"]),
+                    "message": f"{label} « {clean_text(same[0]['name'])} » existe déjà : rien n'a été créé.",
+                }
+            new_id = await client.create_object(entity, {"name": name, **extra})
+            self.audit.write("creation", compte_id=caller.grocy_user_id, type=entity, id=new_id, nom=name)
+            return {"statut": "ok", "cree": True, "id": new_id, "message": f"{label} « {name} » créé(e)."}
+
+        return await self._action(caller, tool, {"nom": name, **extra}, cle, run)
+
+    async def creer_emplacement(
+        self, caller: Caller, nom: str, congelateur: bool = False, cle_idempotence: str | None = None
+    ) -> dict:
+        return await self._create_master(
+            caller, "creer_emplacement", "locations", "Emplacement", nom, {"is_freezer": 1 if congelateur else 0}, cle_idempotence
+        )
+
+    async def creer_categorie(self, caller: Caller, nom: str, cle_idempotence: str | None = None) -> dict:
+        return await self._create_master(caller, "creer_categorie", "product_groups", "Catégorie", nom, {}, cle_idempotence)
