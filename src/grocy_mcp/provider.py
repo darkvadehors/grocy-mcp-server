@@ -9,7 +9,7 @@ import secrets
 from pydantic import AnyUrl
 
 from grocy_mcp.audit import AuditLog
-from grocy_mcp.cimd import CimdError, CimdFetcher
+from grocy_mcp.cimd import CimdError, CimdFetcher, CimdUnavailable
 from grocy_mcp.clients import ClientPolicy, LoopbackAwareClient, clean_name, is_loopback
 from grocy_mcp.config import Settings
 from grocy_mcp.store import FamilyRow, Store, sha256_hex
@@ -68,6 +68,12 @@ class GrocyOAuthProvider:
                 response_types=["code"],
             )
             self.policy.check(client)
+        except CimdUnavailable:
+            if row:  # document déjà validé : on le garde le temps que la panne passe, et on réessaie au prochain appel
+                log.warning("métadonnées client injoignables, document validé précédent conservé")
+                return LoopbackAwareClient.model_validate_json(row[0])
+            log.warning("métadonnées client injoignables")
+            return None
         except (CimdError, RegistrationError, ValueError) as error:
             log.warning("métadonnées client refusées (%s)", type(error).__name__)
             return None

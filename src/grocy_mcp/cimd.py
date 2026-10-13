@@ -19,6 +19,10 @@ class CimdError(Exception):
     pass
 
 
+class CimdUnavailable(CimdError):
+    """Document momentanément injoignable (réseau, DNS, réponse HTTP non 200) — à distinguer d'un document refusé."""
+
+
 async def _resolve(host: str) -> list[str]:
     infos = await anyio.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     return [info[4][0] for info in infos]
@@ -47,21 +51,21 @@ class CimdFetcher:
         try:
             addresses = await self._resolve(host)
         except OSError:
-            raise CimdError("résolution DNS impossible") from None
+            raise CimdUnavailable("résolution DNS impossible") from None
         if not addresses or not all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addresses):
             raise CimdError("adresse IP interdite pour les métadonnées")
         try:
             async with httpx2.AsyncClient(transport=self._transport, follow_redirects=False, timeout=TIMEOUT) as http:
                 async with http.stream("GET", url, headers={"Accept": "application/json"}) as response:
                     if response.status_code != 200:
-                        raise CimdError(f"métadonnées indisponibles ({response.status_code})")
+                        raise CimdUnavailable(f"métadonnées indisponibles ({response.status_code})")
                     body = b""
                     async for chunk in response.aiter_bytes():
                         body += chunk
                         if len(body) > MAX_BYTES:
                             raise CimdError("document de métadonnées trop volumineux")
         except httpx2.HTTPError:
-            raise CimdError("métadonnées injoignables") from None
+            raise CimdUnavailable("métadonnées injoignables") from None
         try:
             document = json.loads(body)
         except ValueError:

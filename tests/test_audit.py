@@ -42,3 +42,18 @@ def test_fields_are_redacted(tmp_path):
     p = tmp_path / "audit.jsonl"
     AuditLog(p).write("x", detail="code=SECRET&state=1")
     assert "SECRET" not in p.read_text()
+
+
+
+def test_restart_when_tail_cut_inside_multibyte_character(tmp_path):
+    """Au-delà de 64 Ko, la lecture de la fin du journal peut commencer au milieu d'un « é » : le service doit redémarrer."""
+    path = tmp_path / "audit.jsonl"
+    AuditLog(path, lambda: 0.0).write("action", note="dernier")
+    last = path.read_bytes()
+    for k in (1, 2):
+        data = b"A" * k + "é".encode() * 40_000 + b"\n" + last
+        if (len(data) - 65_536 - k) % 2 == 1:  # la coupure tombe sur le second octet d'un « é »
+            break
+    path.write_bytes(data)
+    AuditLog(path, lambda: 0.0).write("action", note="après redémarrage")  # ne doit pas lever UnicodeDecodeError
+    assert path.read_text().splitlines()[-1].count("après redémarrage") == 1

@@ -26,10 +26,11 @@ def _last_line(path: Path) -> str | None:
             f.seek(0, os.SEEK_END)
             size = f.tell()
             f.seek(max(0, size - 65_536))
-            lines = f.read().decode().splitlines()
+            lines = [line for line in f.read().split(b"\n") if line.strip()]
     except FileNotFoundError:
         return None
-    return lines[-1] if lines else None
+    # seule la dernière ligne est décodée : la première du bloc lu peut commencer au milieu d'un caractère
+    return lines[-1].decode("utf-8", errors="replace") if lines else None
 
 
 def _clean(value: object) -> object:

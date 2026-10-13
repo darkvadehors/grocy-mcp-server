@@ -250,3 +250,25 @@ async def test_cimd_clients(provider, cimd, clock):
     cimd.docs[bad] = {"client_id": bad, "client_name": "Claude", "redirect_uris": ["https://evil.example/cb"]}
     assert await provider.get_client(bad) is None
     assert await provider.get_client("https://claude.ai/absent.json") is None
+
+
+async def test_cimd_outage_keeps_validated_document(provider, cimd, clock):
+    """Une panne passagère du document CIMD (CDN en 5xx, délai) ne doit pas déconnecter la personne."""
+    from grocy_mcp.cimd import CimdUnavailable
+
+    url = "https://claude.ai/oauth/mcp-client-metadata.json"
+    cimd.docs[url] = {"client_id": url, "client_name": "Claude", "redirect_uris": [CLAUDE]}
+    assert await provider.get_client(url) is not None
+    clock.advance(DAY + 1)
+
+    async def down(_url):
+        cimd.calls += 1
+        raise CimdUnavailable("métadonnées injoignables")
+
+    cimd.fetch = down
+    client = await provider.get_client(url)
+    assert client is not None and str(client.redirect_uris[0]) == CLAUDE
+    calls = cimd.calls
+    await provider.get_client(url)
+    assert cimd.calls == calls + 1  # nouvel essai à chaque fois tant que le document n'a pas été revalidé
+    assert await provider.get_client("https://claude.ai/jamais-vu.json") is None
