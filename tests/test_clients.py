@@ -8,7 +8,6 @@ from grocy_mcp.clients import (
     classify_redirect,
     clean_name,
     display_host,
-    is_loopback,
     origin,
 )
 from mcp.server.auth.provider import RegistrationError

@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import stat
 
 import pytest
@@ -71,7 +72,7 @@ def test_accounts(store):
 
 def test_families_limit_and_revocation(store, clock):
     ids = []
-    for i in range(3):
+    for _ in range(3):
         clock.t += 1
         fid, revoked = store.create_family(3, "c1", "Claude", False, "[]", clock.t + 100, max_active=2)
         ids.append(fid)
@@ -106,7 +107,7 @@ def test_tokens_single_use(store, clock):
     assert store.get_token("r").kind == "refresh"
     assert store.mark_token_used("r") is True
     assert store.mark_token_used("r") is False
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.IntegrityError):
         store.save_token("x", "f", "autre", "c1", 0)
 
 
