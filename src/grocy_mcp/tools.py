@@ -30,6 +30,8 @@ T = TypeVar("T")
 MAX_TEXT = 120
 MAX_RESULTS = 25
 MAX_NAME = 60
+MAX_IMPORT = 30
+NEVER = "2999-12-31"  # « jamais » dans Grocy
 CONFIRMATION_TTL = 300
 IDEMPOTENCY_TTL = 600
 UNDO_WINDOW = 86_400
@@ -400,9 +402,9 @@ class ToolService:
             self.store.record_action(uid)
 
     async def _execute(
-        self, caller: Caller, tool: str, args: dict, run: Callable[[GrocyClient], Awaitable[dict]]
+        self, caller: Caller, tool: str, args: dict, run: Callable[[GrocyClient], Awaitable[dict]], count: int = 1
     ) -> dict:
-        self._consume_quota(caller)
+        self._consume_quota(caller, count)
         base = {"compte_id": caller.grocy_user_id, "client": caller.client_id, "outil": tool, "parametres": args}
         try:
             result = await self._grocy(caller, run)
@@ -750,7 +752,10 @@ class ToolService:
                         f"Annulation impossible : le stock a changé depuis cette action ({clean_text(error.message, 200)})."
                     ) from None
             self.store.mark_undone(last.rowid)
-            return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
+            note = ""
+            if last.tool == "importer_articles":
+                note = " Les produits, emplacements et catégories créés par l'import restent dans Grocy."
+            return {"statut": "ok", "message": f"Action annulée : {last.summary}.{note}", "outil_annule": last.tool}
 
         return await self._execute(caller, "annuler_derniere_action", {"transaction": last.transaction_id}, run)
 
@@ -794,3 +799,274 @@ class ToolService:
 
     async def creer_categorie(self, caller: Caller, nom: str, cle_idempotence: str | None = None) -> dict:
         return await self._create_master(caller, "creer_categorie", "product_groups", "Catégorie", nom, {}, cle_idempotence)
+
+    # --- importer_articles (spec E2 §2.1) -------------------------------------------------------------
+    def _import_line(self, raw: object) -> dict:
+        """Valide une ligne ; renvoie ses champs nettoyés, ou {'erreur': raison}."""
+        if not isinstance(raw, dict):
+            return {"erreur": "ligne illisible (objet attendu)"}
+        code = raw.get("code_barres")
+        code = str(code).strip() if code not in (None, "") else None
+        nom = clean_text(raw.get("nom"), MAX_TEXT) if raw.get("nom") not in (None, "") else None
+        if code is not None and not _BARCODE.fullmatch(code):
+            return {"erreur": "code-barres invalide (8 à 14 chiffres)"}
+        if code is None and not nom:
+            return {"erreur": "ni code-barres ni nom"}
+        quantite = raw.get("quantite", 1)
+        if not _is_number(quantite) or not 0 < quantite <= self.settings.max_quantity:  # type: ignore[operator]
+            return {"erreur": f"quantite invalide (entre 0 et {self.settings.max_quantity})"}
+        when = raw.get("date_peremption")
+        if when not in (None, ""):
+            text = str(when).strip()
+            try:
+                parsed = date.fromisoformat(text) if _ISO_DATE.fullmatch(text) else None
+            except ValueError:
+                parsed = None
+            if parsed is None:
+                return {"erreur": "date_peremption invalide (format AAAA-MM-JJ)"}
+            when = parsed.isoformat()
+        else:
+            when = None
+        place = clean_text(raw.get("emplacement"), MAX_NAME) if raw.get("emplacement") not in (None, "") else None
+        group = clean_text(raw.get("categorie"), MAX_NAME) if raw.get("categorie") not in (None, "") else None
+        return {"code": code, "nom": nom, "quantite": _num(quantite), "date": when, "emplacement": place, "categorie": group}
+
+    @staticmethod
+    def _by_name(rows: list[dict], name: str | None) -> dict | None:
+        if not name:
+            return None
+        return next((r for r in rows if fold(str(r["name"])) == fold(name)), None)
+
+    async def importer_articles(self, caller: Caller, articles: object, jeton_confirmation: str | None = None) -> dict:
+        tool = "importer_articles"
+        if not isinstance(articles, list) or not articles:
+            raise ToolFailure("articles doit être une liste non vide d'articles.")
+        if len(articles) > MAX_IMPORT:
+            raise ToolFailure(f"{MAX_IMPORT} articles au plus par import : découpez la liste en plusieurs appels.")
+        lines = [self._import_line(raw) for raw in articles]
+        canonical = json.dumps(lines, sort_keys=True, ensure_ascii=False)
+        slot = f"{tool}:{hashlib.sha256(canonical.encode()).hexdigest()}"
+        if jeton_confirmation:
+            return await self._import_confirm(caller, self._take_confirmation(caller, tool, jeton_confirmation), slot)
+        previous = self.store.get_idempotent(caller.grocy_user_id, slot, IDEMPOTENCY_TTL)
+        if previous is not None:
+            return {
+                "statut": "deja_importe",
+                "message": "Cette même liste a déjà été importée il y a moins de 10 minutes : rien n'a été refait. "
+                "Si c'est voulu (nouvel achat identique), attendez ou modifiez la liste.",
+                "bilan": json.loads(previous).get("lignes", []),
+            }
+        return await self._grocy(caller, lambda client: self._import_preview(caller, client, lines))
+
+    async def _import_preview(self, caller: Caller, client: GrocyClient, lines: list[dict]) -> dict:
+        products = [p for p in await client.products() if int(p.get("active", 1)) == 1]
+        locations, groups = await client.locations(), await client.product_groups()
+        out, plan, new_places, new_groups = [], [], {}, {}
+        seen_codes: dict[str, int] = {}
+        for number, line in enumerate(lines, start=1):
+            if "erreur" in line:
+                out.append({"ligne": number, "statut": "ignore", "raison": line["erreur"]})
+                continue
+            entry = {"ligne": number, "quantite": line["quantite"], "date_peremption": line["date"] or NEVER}
+            step: dict = {"quantite": line["quantite"], "date": line["date"] or NEVER, "code": line["code"]}
+            if line["code"] and line["code"] in seen_codes:  # même code plus haut dans la liste
+                first = plan[seen_codes[line["code"]]]
+                step.update({k: first[k] for k in ("action", "product_id", "nom", "creation") if k in first})
+                step["action"] = "acheter_meme_que" if first["action"] != "acheter" else "acheter"
+                step["reference"] = seen_codes[line["code"]]
+                entry.update({"statut": "meme_produit_que_ligne", "nom": first["nom"], "reference": first["ligne"]})
+            else:
+                status, detail = await self._import_resolve(client, products, line)
+                if status == "ignore":
+                    out.append({**entry, "statut": "ignore", "raison": detail})
+                    continue
+                step.update(detail)
+                entry.update({"statut": status, "nom": detail["nom"]})
+                if status == "connu" and detail.get("ajouter_code"):
+                    entry["code_ajoute"] = True
+                if status == "identifie":
+                    entry["source"] = detail.get("source", "recherche multi-sources")
+                if status == "a_creer_sous_ce_nom":
+                    entry["a_verifier"] = True
+                if line["code"]:
+                    seen_codes[line["code"]] = len(plan)
+            place = line["emplacement"]
+            if place:
+                found = self._by_name(locations, place)
+                step["emplacement"] = {"id": int(found["id"])} if found else {"creer": place}
+                entry["emplacement"] = clean_text(found["name"]) if found else f"{place} (à créer)"
+                if not found:
+                    new_places.setdefault(fold(place), place)
+            if line["categorie"] and step["action"] in ("identifier_creer", "creer_nom"):
+                found = self._by_name(groups, line["categorie"])
+                step["categorie"] = {"id": int(found["id"])} if found else {"creer": line["categorie"]}
+                entry["categorie"] = clean_text(found["name"]) if found else f"{line['categorie']} (à créer)"
+                if not found:
+                    new_groups.setdefault(fold(line["categorie"]), line["categorie"])
+            step["ligne"] = number
+            plan.append(step)
+            out.append(entry)
+
+        if not plan:
+            return {"statut": "rien_a_importer", "message": "Aucune ligne importable.", "lignes": out}
+        left = self._quota_left(caller)
+        message = (
+            "Aperçu de l'import : rien n'a été modifié. Montrez-le à la personne, puis rappelez importer_articles avec "
+            "les mêmes articles et jeton_confirmation pour confirmer (5 minutes)."
+        )
+        if len(plan) > left:
+            message += f" Attention : quota insuffisant ({left} actions restantes pour {len(plan)} achats), la confirmation sera refusée."
+        ignored = [{"ligne": e["ligne"], "resultat": "ignore", "raison": e["raison"]} for e in out if e["statut"] == "ignore"]
+        payload = {
+            "plan": plan,
+            "ignores": ignored,
+            "emplacements": list(new_places.values()),
+            "categories": list(new_groups.values()),
+        }
+        return {
+            "statut": "confirmation_requise",
+            "message": message,
+            "lignes": out,
+            "a_creer": {"emplacements": payload["emplacements"], "categories": payload["categories"]},
+            "jeton_confirmation": self._new_confirmation(caller, "importer_articles", payload),
+        }
+
+    async def _import_resolve(self, client: GrocyClient, products: list[dict], line: dict) -> tuple[str, Any]:
+        code, nom = line["code"], line["nom"]
+        if code:
+            details = await client.product_by_barcode(code)
+            if details:
+                product = details["product"]
+                return "connu", {"action": "acheter", "product_id": int(product["id"]), "nom": clean_text(product["name"])}
+            proposal = await client.external_lookup(code)
+            if proposal and proposal.get("name"):
+                proposed = clean_text(proposal["name"], MAX_TEXT)
+                same = self._by_name(products, proposed) or self._by_name(products, nom)
+                if same:  # même produit déjà enregistré sous un autre code : on lui ajoute ce code
+                    return "connu", {"action": "acheter", "product_id": int(same["id"]), "nom": clean_text(same["name"]), "ajouter_code": True}
+                return "identifie", {
+                    "action": "identifier_creer",
+                    "nom": proposed,
+                    "source": clean_text(proposal.get("description") or "recherche multi-sources", MAX_TEXT),
+                    "creation": {
+                        "brut_identique": proposed == proposal["name"],
+                        "location_id": proposal.get("location_id"),
+                        "qu_id": proposal.get("qu_id_stock"),
+                        "description": clean_text(proposal.get("description") or "", 200),
+                    },
+                }
+            if nom:
+                same = self._by_name(products, nom)
+                if same:
+                    return "connu", {"action": "acheter", "product_id": int(same["id"]), "nom": clean_text(same["name"]), "ajouter_code": True}
+                return "a_creer_sous_ce_nom", {"action": "creer_nom", "nom": nom, "creation": {}}
+            return "ignore", "code-barres inconnu de Grocy et de la recherche multi-sources, et aucun nom fourni"
+        status, found = await self._find_product(client, nom)
+        if status == "ok":
+            return "connu", {"action": "acheter", "product_id": int(found["id"]), "nom": clean_text(found["name"])}
+        if status == "ambigu":
+            names = ", ".join(clean_text(p["name"]) for p in found[:5])
+            return "ignore", f"plusieurs produits correspondent ({names}) : précisez"
+        return "ignore", "produit introuvable et sans code-barres : aucune création possible"
+
+    async def _import_confirm(self, caller: Caller, payload: dict, slot: str) -> dict:
+        plan = payload["plan"]
+
+        async def run(client: GrocyClient) -> dict:
+            locations = await client.locations()
+            groups = await client.product_groups()
+            units = await client.quantity_units()
+            place_ids: dict[str, int] = {}
+            for name in payload["emplacements"]:
+                found = self._by_name(locations, name)
+                place_ids[fold(name)] = int(found["id"]) if found else await client.create_object("locations", {"name": name})
+            group_ids: dict[str, int] = {}
+            for name in payload["categories"]:
+                found = self._by_name(groups, name)
+                group_ids[fold(name)] = int(found["id"]) if found else await client.create_object("product_groups", {"name": name})
+            default_place = int(locations[0]["id"]) if locations else None
+            default_unit = int(units[0]["id"]) if units else None
+
+            def ref(value: dict | None, ids: dict[str, int]) -> int | None:
+                if not value:
+                    return None
+                return int(value["id"]) if "id" in value else ids[fold(value["creer"])]
+
+            results, transactions = [], []
+            stop: str | None = None
+            for step in plan:
+                line = {"ligne": step["ligne"], "nom": step["nom"]}
+                if stop:
+                    results.append({**line, "resultat": "non_traite", "raison": stop})
+                    continue
+                try:
+                    pid, created = await self._import_product(client, step, plan, ref, place_ids, group_ids, default_place, default_unit)
+                    location_id = ref(step.get("emplacement"), place_ids)
+                    rows = await client.purchase(pid, step["quantite"], best_before_date=step["date"], location_id=location_id)
+                    if rows:
+                        transactions.append(str(rows[0]["transaction_id"]))
+                    results.append({**line, "resultat": "cree_et_ajoute" if created else "ajoute", "produit_id": pid})
+                except _SkipLine as skip:
+                    results.append({**line, "resultat": "ignore", "raison": str(skip)})
+                except (GrocyRequestError, GrocyForbidden) as error:
+                    results.append({**line, "resultat": "ignore", "raison": f"refusé par Grocy : {clean_text(error.message, 200)}"})
+                except GrocyUnavailable:
+                    stop = "Grocy ne répond plus : ligne non traitée"
+                    results.append({**line, "resultat": "incertain", "raison": "Grocy n'a pas répondu ; vérifiez ce produit"})
+            done = sum(1 for r in results if r["resultat"] in ("ajoute", "cree_et_ajoute"))
+            if transactions:
+                self.store.record_undo(caller.grocy_user_id, " ".join(transactions), "importer_articles", f"import de {done} article(s)")
+            all_lines = sorted(results + payload.get("ignores", []), key=lambda r: r["ligne"])
+            return {
+                "statut": "ok" if done else "rien_importe",
+                "message": f"{done} article(s) ajouté(s) au stock sur {len(plan)}."
+                + (" annuler_derniere_action annule tous les achats de cet import." if done else ""),
+                "lignes": all_lines,
+                "transaction_id": " ".join(transactions) or None,
+            }
+
+        result = await self._execute(caller, "importer_articles", {"lignes": len(plan), "confirmation": True}, run, count=len(plan))
+        if result.get("statut") == "ok":
+            self.store.save_idempotent(caller.grocy_user_id, slot, json.dumps(result, ensure_ascii=False))
+        return result
+
+    async def _import_product(self, client, step, plan, ref, place_ids, group_ids, default_place, default_unit) -> tuple[int, bool]:
+        """Renvoie (id du produit, créé ?) pour une étape du plan ; crée la fiche si besoin."""
+        if step["action"] == "acheter":
+            pid = int(step["product_id"]) if "product_id" in step else int(plan[step["reference"]]["_pid"])
+            if step.get("ajouter_code") and step.get("code") and not await client.product_by_barcode(step["code"]):
+                await client.create_object("product_barcodes", {"product_id": pid, "barcode": step["code"]})
+            step["_pid"] = pid
+            return pid, False
+        if step["action"] == "acheter_meme_que":
+            first = plan[step["reference"]]
+            if "_pid" not in first:
+                raise _SkipLine("le produit de la ligne de référence n'a pas pu être créé")
+            return int(first["_pid"]), False
+        code = step["code"]
+        if code and await client.product_by_barcode(code):  # apparu depuis l'aperçu : jamais de produit orphelin
+            raise _SkipLine("ce code-barres a été ajouté à Grocy entre-temps : redemandez un aperçu")
+        creation = step.get("creation") or {}
+        group_id = ref(step.get("categorie"), group_ids)
+        if step["action"] == "identifier_creer" and creation.get("brut_identique") and group_id is None:
+            created = await client.external_lookup(code, add=True)
+            if not created or "id" not in created:
+                raise _SkipLine("la recherche multi-sources ne propose plus ce produit")
+            pid = int(created["id"])
+        else:
+            location_id = ref(step.get("emplacement"), place_ids) or creation.get("location_id") or default_place
+            unit = creation.get("qu_id") or default_unit
+            data = {"name": step["nom"], "location_id": location_id, "qu_id_purchase": unit, "qu_id_stock": unit}
+            data["description"] = creation.get("description") or "Créé par import (à vérifier)"
+            if group_id is not None:
+                data["product_group_id"] = group_id
+            pid = await client.create_object("products", data)
+            if code:
+                await client.create_object("product_barcodes", {"product_id": pid, "barcode": code})
+        self.audit.write("creation", type="products", id=pid, nom=step["nom"])
+        step["_pid"] = pid
+        return pid, True
+
+
+class _SkipLine(Exception):
+    """Ligne d'import ignorée à la confirmation (raison destinée à la personne)."""

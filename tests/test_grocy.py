@@ -133,7 +133,7 @@ async def test_external_lookup_requires_master_data_edit(fake):
 async def test_create_objects_and_product_groups(fake):
     c = client(fake)
     loc = await c.create_object("locations", {"name": "Cave", "is_freezer": 0})
-    assert any(l["id"] == loc and l["name"] == "Cave" for l in await c.locations())
+    assert any(row["id"] == loc and row["name"] == "Cave" for row in await c.locations())
     group = await c.create_object("product_groups", {"name": "Boissons"})
     assert [g["id"] for g in await c.product_groups()] == [group]
     pid = await c.create_object("products", {"name": "Eau", "location_id": loc, "qu_id_purchase": 1, "qu_id_stock": 1})
