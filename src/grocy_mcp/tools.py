@@ -129,9 +129,9 @@ class ToolService:
         except GrocyUnavailable:
             raise ToolFailure(UNAVAILABLE) from None
         except GrocyForbidden as error:
-            raise ToolFailure(f"Ce compte Grocy n'a pas la permission nécessaire ({error.message}).") from None
+            raise ToolFailure(f"Ce compte Grocy n'a pas la permission nécessaire ({clean_text(error.message, 200)}).") from None
         except GrocyRequestError as error:
-            raise ToolFailure(f"Grocy a refusé l'opération : {error.message}") from None
+            raise ToolFailure(f"Grocy a refusé l'opération : {clean_text(error.message, 200)}") from None
 
     async def _confirm_revocation(self, caller: Caller, client: GrocyClient) -> NoReturn:
         """Spec §3.8 : un 401 de Grocy est vérifié une seconde fois avant de révoquer les connexions du compte."""
@@ -725,7 +725,7 @@ class ToolService:
             try:
                 await client.undo(last.transaction_id)
             except GrocyRequestError as error:
-                raise ToolFailure(f"Annulation impossible : le stock a changé depuis cette action ({error.message}).") from None
+                raise ToolFailure(f"Annulation impossible : le stock a changé depuis cette action ({clean_text(error.message, 200)}).") from None
             self.store.mark_undone(last.rowid)
             return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
 
