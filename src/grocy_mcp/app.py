@@ -175,10 +175,12 @@ def register_tools(server: MCPServer, service: ToolService) -> None:
         sous le nom fourni, à vérifier) ; « ignore » (avec la raison). Emplacements et catégories inconnus sont créés.
         Montrez l'aperçu, puis rappelez avec les MÊMES articles et le jeton_confirmation après accord de la personne.
         Date absente : « jamais » (2999-12-31). annuler_derniere_action annule tous les achats de l'import.
-        Sauvegarde FoodShiner (.foodshiner) : c'est un zip ; lire backup/data.json ; pour chaque élément de inventory[],
-        code_barres = barcode du produit de products[] dont id = productId ; nom = productName ; quantite = quantity ;
-        emplacement = name de storages[] dont id = storageId (type « Storage ») ; date_peremption = expirationDate
-        convertie (secondes depuis le 2001-01-01 UTC, format AAAA-MM-JJ), à omettre si elle est égale à storageDate."""
+        Sauvegarde FoodShiner (.foodshiner) : c'est un zip ; lire backup/data.json ; garder les éléments de inventory[]
+        dont storageId désigne un élément de storages[] de type « Storage » (ignorer le type « ShoppingList » : ce sont
+        des listes de courses, pas du stock) ; code_barres = barcode (en texte) du produit de products[] dont
+        id = productId ; nom = productName ; quantite = quantity (ignorer si 0) ; emplacement = name du storage ;
+        date_peremption = expirationDate (secondes depuis le 2001-01-01 00:00 UTC) convertie en date du fuseau
+        Europe/Zurich, format AAAA-MM-JJ, à omettre si expirationDate est égal à storageDate (aucune date saisie)."""
         return await _call(service.importer_articles, [a.model_dump() for a in articles], jeton_confirmation)
 
     @server.tool(title="Créer un emplacement", annotations=ADD)

@@ -11,6 +11,8 @@ import httpx2
 
 _KEY = re.compile(r"[A-Za-z0-9]{20,100}")
 _BARCODE = re.compile(r"[0-9]{8,14}")
+# La recherche multi-sources interroge plusieurs sources (4 s chacune, budget global 12 s) : délai plus long.
+LOOKUP_TIMEOUT = 20.0
 _TRANSACTION = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
@@ -90,14 +92,16 @@ class GrocyClient:
     def __repr__(self) -> str:
         return f"GrocyClient({self._base_url!r}, <clé masquée>)"
 
-    async def _request(self, method: str, path: str, *, params: dict | None = None, body: dict | None = None) -> Any:
+    async def _request(
+        self, method: str, path: str, *, params: dict | None = None, body: dict | None = None, timeout: float | None = None
+    ) -> Any:
         if not path.startswith("/api/"):
             raise ValueError("chemin hors de l'API Grocy")
         headers = {"GROCY-API-KEY": self._key, "Accept": "application/json"}
         async with httpx2.AsyncClient(
             base_url=self._base_url,
             transport=self._transport,
-            timeout=self._timeout,
+            timeout=timeout or self._timeout,
             follow_redirects=False,
             headers=headers,
         ) as http:
@@ -135,7 +139,9 @@ class GrocyClient:
         if not _BARCODE.fullmatch(code):
             raise GrocyRequestError("code-barres invalide (8 à 14 chiffres)")
         params = {"add": "true"} if add else None
-        result = await self._request("GET", f"/api/stock/barcodes/external-lookup/{code}", params=params)
+        result = await self._request(
+            "GET", f"/api/stock/barcodes/external-lookup/{code}", params=params, timeout=LOOKUP_TIMEOUT
+        )
         return result if isinstance(result, dict) else None
 
     async def product_groups(self) -> list[dict]:

@@ -341,6 +341,11 @@ class Store:
     def release_idempotent(self, grocy_user_id: int, key: str) -> None:
         self._exec("DELETE FROM idempotency WHERE grocy_user_id = ? AND key = ?", (grocy_user_id, key))
 
+    def release_idempotent_prefix(self, grocy_user_id: int, prefix: str) -> None:
+        self._exec(
+            "DELETE FROM idempotency WHERE grocy_user_id = ? AND substr(key, 1, ?) = ?", (grocy_user_id, len(prefix), prefix)
+        )
+
     def save_idempotent(self, grocy_user_id: int, key: str, result_json: str) -> None:
         self._exec(
             "INSERT INTO idempotency(grocy_user_id, key, result, created_at) VALUES(?, ?, ?, ?) "
@@ -369,6 +374,9 @@ class Store:
             (grocy_user_id,),
         )
         return UndoRow(*row[:5], bool(row[5])) if row else None
+
+    def update_undo(self, rowid: int, transaction_id: str) -> None:
+        self._exec("UPDATE undo SET transaction_id = ? WHERE rowid = ?", (transaction_id, rowid))
 
     def mark_undone(self, rowid: int) -> None:
         self._exec("UPDATE undo SET undone = 1 WHERE rowid = ?", (rowid,))
