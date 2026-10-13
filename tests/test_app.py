@@ -236,3 +236,13 @@ async def test_s1_no_secret_in_logs(http, caplog, settings):
     journals = caplog.text + settings.audit_path.read_text()
     for secret in secrets_seen:
         assert secret not in journals
+
+
+
+async def test_authorize_binds_request_to_browser(http):
+    client = (await register(http)).json()
+    SECRETS.append(client["client_secret"])
+    _, challenge = pkce()
+    response = await authorize(http, client, challenge)
+    cookie = response.headers.get("set-cookie", "").lower()
+    assert cookie.startswith("__host-mcp_req=") and "samesite=lax" in cookie and "secure" in cookie and "httponly" in cookie

@@ -6,7 +6,7 @@ import html
 import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
@@ -25,6 +25,9 @@ from mcp.shared.auth import OAuthClientInformationFull
 CSRF_COOKIE = "__Host-mcp_csrf"
 SESSION_COOKIE = "__Host-mcp_gestion"
 FORM_TTL = 600
+# Lie la demande de connexion au navigateur qui a ouvert /authorize : un lien /connexion?req=… transmis à quelqu'un
+# d'autre (hameçonnage du consentement) ne s'ouvre pas. SameSite=Lax car /authorize arrive depuis claude.ai ou chatgpt.com.
+REQ_COOKIE = "__Host-mcp_req"
 MAX_FORM_BYTES = 4096
 
 KEY_MESSAGES = {
@@ -106,6 +109,28 @@ def _when(timestamp: float | None) -> str:
     return datetime.fromtimestamp(timestamp, UTC).strftime("%d/%m/%Y %H:%M UTC")
 
 
+def bind_authorize(asgi_app, public_url: str):
+    """Enveloppe la route /authorize du SDK : pose REQ_COOKIE quand elle redirige vers /connexion."""
+    prefix = f"{public_url}/connexion?req=".encode()
+
+    async def wrapped(scope, receive, send):
+        async def send_with_cookie(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                location = next((v for k, v in headers if k.lower() == b"location"), b"")
+                if location.startswith(prefix):
+                    req = parse_qs(urlsplit(location.decode("latin-1")).query).get("req", [""])[0]
+                    if req.replace("-", "").replace("_", "").isalnum():
+                        cookie = f"{REQ_COOKIE}={req}; Max-Age={FORM_TTL}; Path=/; Secure; HttpOnly; SameSite=Lax"
+                        headers.append((b"set-cookie", cookie.encode()))
+                        message = {**message, "headers": headers}
+            await send(message)
+
+        await asgi_app(scope, receive, send_with_cookie)
+
+    return wrapped
+
+
 def _redirect(url: str) -> RedirectResponse:
     return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
@@ -170,6 +195,21 @@ class Pages:
         return outcome, user, key if outcome is KeyCheck.OK else None
 
     @staticmethod
+    def _same_browser(request: Request, req: str) -> bool:
+        bound = request.cookies.get(REQ_COOKIE, "")
+        return bool(bound and req) and secrets.compare_digest(bound, req)
+
+    @staticmethod
+    def _other_browser() -> HTMLResponse:
+        return page(
+            "Connexion non reconnue",
+            "<p>Cette demande de connexion n'a pas été lancée depuis ce navigateur. Par sécurité, elle ne peut pas "
+            "être poursuivie ici. Si vous voulez connecter Grocy, lancez la connexion vous-même depuis Claude ou "
+            "ChatGPT ; si quelqu'un vous a envoyé ce lien, ignorez-le.</p>",
+            400,
+        )
+
+    @staticmethod
     def _expired() -> HTMLResponse:
         return page(
             "Demande expirée",
@@ -207,6 +247,8 @@ class Pages:
             + (f'<p class="erreur" role="alert">{_e(error)}</p>' if error else "")
             + '<form method="post" action="/connexion">'
             f'<input type="hidden" name="req" value="{_e(req)}"><input type="hidden" name="csrf" value="{_e(csrf)}">'
+            "<p class=\"aide\">Ne continuez que si vous venez vous-même de lancer cette connexion depuis Claude ou "
+            "ChatGPT. Si quelqu'un vous a envoyé ce lien, refusez.</p>"
             "<label for=\"cle\">Clé API Grocy de votre compte dédié à l'IA</label>"
             '<input id="cle" name="cle" type="password" autocomplete="off" autocapitalize="off" '
             'spellcheck="false" maxlength="200">'
@@ -240,6 +282,8 @@ class Pages:
             client = await self.provider.get_client(pending.client_id) if pending else None
             if pending is None or client is None:
                 return self._expired()
+            if not self._same_browser(request, req):
+                return self._other_browser()
             csrf = secrets.token_urlsafe(32)
             self.store.set_pending_csrf(pending.id_hash, sha256_hex(csrf))
             response = self._key_page(req, csrf, client, AuthorizationParams.model_validate_json(pending.params))
@@ -253,6 +297,8 @@ class Pages:
         pending = self._pending(req)
         if pending is None:
             return self._expired()
+        if not self._same_browser(request, req):
+            return self._other_browser()
         if not self._csrf_matches(request, csrf, pending.csrf_hash):
             return self._session_lost(f"/connexion?req={req}")
         client = await self.provider.get_client(pending.client_id)

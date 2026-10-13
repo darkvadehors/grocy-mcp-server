@@ -20,7 +20,7 @@ from grocy_mcp.grocy import GrocyClient
 from grocy_mcp.provider import GrocyOAuthProvider
 from grocy_mcp.store import Store
 from grocy_mcp.tools import Caller, ToolFailure, ToolService
-from grocy_mcp.web import Pages
+from grocy_mcp.web import Pages, bind_authorize
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -212,6 +212,9 @@ def build_app(
             methods=["GET", "OPTIONS"],
         ),
     )
+    for route in app.router.routes:
+        if getattr(route, "path", None) == "/authorize":
+            route.app = bind_authorize(route.app, settings.public_url)
     app.router.routes.extend(Pages(settings, store, box, provider, grocy_factory, audit).routes())
     app.router.routes.append(Route("/sante", health, methods=["GET"]))
     return app

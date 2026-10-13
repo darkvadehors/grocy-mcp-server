@@ -11,7 +11,8 @@ from grocy_mcp.cimd import CimdFetcher
 from grocy_mcp.clients import ClientPolicy
 from grocy_mcp.grocy import GrocyClient
 from grocy_mcp.provider import GrocyOAuthProvider
-from grocy_mcp.web import Pages
+from grocy_mcp.store import sha256_hex
+from grocy_mcp.web import REQ_COOKIE, Pages
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 from tests.fake_grocy import KEY_ADMIN, KEY_ELLI_IA, KEY_JOHNNY_IA
@@ -51,6 +52,7 @@ async def start(env, cid="c1", uri=CLAUDE, state="st"):
     )
     url = await env.provider.authorize(await env.provider.get_client(cid), params)
     req = parse_qs(urlsplit(url).query)["req"][0]
+    env.http.cookies.set(REQ_COOKIE, req, domain="mcp.example.test", path="/")  # posé par /authorize (voir test_app)
     return req, await env.http.get(f"/connexion?req={req}")
 
 
@@ -182,3 +184,19 @@ async def test_connexions_session_expires(env, clock):
 async def test_stylesheet(env):
     response = await env.http.get("/style.css")
     assert response.status_code == 200 and response.headers["content-type"].startswith("text/css")
+
+
+async def test_connexion_link_opened_in_another_browser_is_refused(env):
+    """Hameçonnage du consentement : un lien /connexion?req=… envoyé à une victime ne s'ouvre pas sans le cookie de /authorize."""
+    req, _ = await start(env)
+    env.http.cookies.clear()
+    page = await env.http.get(f"/connexion?req={req}")
+    assert page.status_code == 400 and "depuis ce navigateur" in page.text and "cle" not in page.text
+    forged = await post(env, "/connexion", req=req, csrf="x", action="verifier", cle=KEY_JOHNNY_IA)
+    assert forged.status_code == 400
+    assert env.store.get_pending(sha256_hex(req)).enc_key is None
+
+
+async def test_key_page_warns_to_continue_only_if_self_initiated(env):
+    _, page = await start(env)
+    assert "vous venez vous-même de lancer" in page.text
