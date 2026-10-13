@@ -21,8 +21,7 @@ TOOLS = {
     "rechercher_produit", "voir_stock", "voir_peremptions", "voir_produit", "voir_liste_courses",
     "recettes_faisables", "voir_references", "ajouter_liste_courses", "retirer_liste_courses",
     "ajouter_manquants_liste", "enregistrer_achat", "consommer", "ouvrir", "deplacer",
-    "corriger_inventaire", "annuler_derniere_action",
-}
+    "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie"}
 SECRETS: list[str] = []
 
 
@@ -246,3 +245,21 @@ async def test_authorize_binds_request_to_browser(http):
     response = await authorize(http, client, challenge)
     cookie = response.headers.get("set-cookie", "").lower()
     assert cookie.startswith("__host-mcp_req=") and "samesite=lax" in cookie and "secure" in cookie and "httponly" in cookie
+
+
+async def test_import_de_bout_en_bout(http, fake):
+    """importer_articles via MCP : aperçu, confirmation, création par la recherche multi-sources ; 19 outils exposés."""
+    _, tokens, _, _ = await login(http)
+    access = tokens["access_token"]
+    listing = (await rpc(http, access, "tools/list")).json()["result"]["tools"]
+    assert len(listing) == 19
+    importer = next(t for t in listing if t["name"] == "importer_articles")
+    assert "FoodShiner" in importer["description"] and importer["annotations"]["destructiveHint"] is False
+    fake.lookup_db["5449000000996"] = {"name": "Coca-Cola 33 cl"}
+    articles = [{"code_barres": "5449000000996", "quantite": 1, "emplacement": "Frigo"}]
+    error, preview = await tool(http, access, "importer_articles", articles=articles)
+    assert not error and preview["statut"] == "confirmation_requise"
+    error, done = await tool(http, access, "importer_articles", articles=articles, jeton_confirmation=preview["jeton_confirmation"])
+    assert not error and done["statut"] == "ok" and "5449000000996" in fake.barcodes
+    error, created = await tool(http, access, "creer_categorie", nom="Boissons")
+    assert not error and created["cree"] is True

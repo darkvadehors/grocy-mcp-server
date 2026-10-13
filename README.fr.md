@@ -12,7 +12,7 @@ Construit sur le SDK Python officiel de MCP (`mcp==2.3.0`) : le même processus 
 - **Enregistrement des clients** (DCR) limité aux URI de retour officielles de Claude et ChatGPT, à la boucle locale (port libre) et à `MCP_EXTRA_REDIRECT_URIS` ; documents de métadonnées client (CIMD) récupérés uniquement depuis `MCP_CIMD_HOSTS`, sans redirection, taille plafonnée, adresses non publiques refusées. Les noms de fournisseurs (Claude, ChatGPT, Anthropic, OpenAI) sont réservés.
 - **Clé Grocy** collée par la personne sur la page `/connexion` : vérifiée par `GET /api/user`, refusée si elle appartient à un administrateur, chiffrée en AES-GCM (clé maître chargée depuis un identifiant systemd), déchiffrée seulement le temps d'un appel à Grocy, jamais journalisée, jamais renvoyée.
 - **Jetons** de 256 bits, stockés uniquement sous forme d'empreinte SHA-256, à usage unique, remplacés à chaque renouvellement ; le rejeu d'un code ou d'un jeton déjà utilisé révoque toute la connexion. Durées : accès 1 h, renouvellement 30 jours glissants (7 jours pour la boucle locale), connexion 90 jours au plus.
-- **Garde-fous sur les actions** : quantité plafonnée par appel, confirmation en deux temps pour les grosses corrections d'inventaire et toujours pour l'ajout des manquants (aperçu puis jeton), quotas (30/min, 300/h par compte), clés d'idempotence (10 min), annulation de la dernière action (< 24 h). **Aucun outil de suppression.** Aucun outil ne prend d'identifiant d'utilisateur.
+- **Garde-fous sur les actions** : quantité plafonnée par appel, confirmation en deux temps pour les grosses corrections d'inventaire et toujours pour l'ajout des manquants (aperçu puis jeton), quotas (30/min, 300/h par compte), clés d'idempotence (10 min), annulation de la dernière action (< 24 h). **Aucun outil de suppression ni de modification** (produits, emplacements et catégories peuvent seulement être créés). Aucun outil ne prend d'identifiant d'utilisateur.
 - **Journal d'audit** en JSON Lines, chaîné par empreinte, secrets masqués.
 - **Pages** sans JavaScript, CSP stricte, cookies `__Host-`, jetons anti-falsification ; transport protégé contre les `Origin` étrangers et les `Host` inattendus (DNS rebinding).
 - Une clé Grocy révoquée dans Grocy révoque les connexions correspondantes ; une panne ou une lenteur de Grocy ne déconnecte jamais personne.
@@ -36,13 +36,18 @@ Construit sur le SDK Python officiel de MCP (`mcp==2.3.0`) : le même processus 
 | `ouvrir` | Marquer un produit comme ouvert | action |
 | `deplacer` | Déplacer un produit d'un emplacement à un autre | action |
 | `corriger_inventaire` | Indiquer la quantité réelle d'un produit | action |
+| `importer_articles` | Importer une liste d'articles scannés (par exemple une sauvegarde FoodShiner) en deux temps : aperçu, puis confirmation ; les codes-barres inconnus sont identifiés par la recherche externe de Grocy | action |
+| `creer_emplacement` | Créer un emplacement | action |
+| `creer_categorie` | Créer une catégorie (groupe de produits) | action |
 | `annuler_derniere_action` | Annuler la dernière action faite par ce serveur | action |
 
 ## Prérequis Grocy
 
 Créer **un compte Grocy dédié, non administrateur, par personne** (par exemple `alice-ia`). Grocy donne la permission `ADMIN` aux nouveaux comptes : la retirer. N'accorder que :
 
-`STOCK_PURCHASE`, `STOCK_CONSUME`, `STOCK_INVENTORY`, `STOCK_TRANSFER`, `STOCK_OPEN`, `STOCK_EDIT` (nécessaire à l'annulation), `SHOPPINGLIST_ITEMS_ADD`, `SHOPPINGLIST_ITEMS_DELETE`, `RECIPES`.
+`STOCK_PURCHASE`, `STOCK_CONSUME`, `STOCK_INVENTORY`, `STOCK_TRANSFER`, `STOCK_OPEN`, `STOCK_EDIT` (nécessaire à l'annulation), `SHOPPINGLIST_ITEMS_ADD`, `SHOPPINGLIST_ITEMS_DELETE`, `RECIPES`, `MASTER_DATA_EDIT` (création de produits, d'emplacements et de catégories).
+
+À savoir : dans Grocy, `MASTER_DATA_EDIT` permet aussi de modifier et de supprimer produits, emplacements et catégories — il n'existe pas de permission de création seule. Ce serveur n'expose aucun outil qui les modifie ou les supprime, mais une clé volée d'un tel compte le pourrait.
 
 Créer ensuite une clé API pour ce compte (Grocy → menu de l'utilisateur → Gérer les clés API).
 

@@ -12,7 +12,7 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 - **Client registration** (DCR) limited to the official redirect URIs of Claude and ChatGPT, local loopback (any port) and `MCP_EXTRA_REDIRECT_URIS`; Client ID Metadata Documents (CIMD) fetched only from `MCP_CIMD_HOSTS`, without redirects, size-capped, non-public addresses refused. Provider names (Claude, ChatGPT, Anthropic, OpenAI) are reserved.
 - **Grocy key** pasted by the person on the `/connexion` page: checked with `GET /api/user`, refused if it belongs to an administrator, encrypted with AES-GCM (master key loaded from a systemd credential), decrypted only for the duration of a Grocy call, never logged, never returned.
 - **Tokens** of 256 bits, stored only as SHA-256 hashes, single use, rotated on every refresh; replaying a used code or refresh token revokes the whole connection. Lifetimes: access 1 h, refresh 30 days (sliding, 7 days for loopback clients), connection 90 days at most.
-- **Guardrails on actions**: per-call quantity cap, two-step confirmation for large inventory corrections and always for adding missing products (preview, then token), rate limits (30/min, 300/h per account), idempotency keys (10 min), undo of the last action (< 24 h). **No delete tool.** No tool takes a user identifier.
+- **Guardrails on actions**: per-call quantity cap, two-step confirmation for large inventory corrections and always for adding missing products (preview, then token), rate limits (30/min, 300/h per account), idempotency keys (10 min), undo of the last action (< 24 h). **No delete or edit tool** (products, locations and product groups can only be created). No tool takes a user identifier.
 - **Audit log** in JSON Lines, hash-chained, secrets masked.
 - **Pages** without JavaScript, strict CSP, `__Host-` cookies, CSRF tokens; transport protected against foreign `Origin` and unexpected `Host` (DNS rebinding).
 - A Grocy key revoked in Grocy revokes the matching connections; a Grocy outage or timeout never disconnects anyone.
@@ -36,6 +36,9 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 | `ouvrir` | Mark a product as opened | action |
 | `deplacer` | Move a product between locations | action |
 | `corriger_inventaire` | Set the real quantity of a product | action |
+| `importer_articles` | Import a list of scanned items (e.g. a FoodShiner backup) in two steps: preview, then confirmation; unknown barcodes are identified with Grocy's external barcode lookup | action |
+| `creer_emplacement` | Create a location | action |
+| `creer_categorie` | Create a product group | action |
 | `annuler_derniere_action` | Undo the last action made through this server | action |
 
 Tool names and messages are in French.
@@ -44,7 +47,9 @@ Tool names and messages are in French.
 
 Create **one dedicated, non-administrator Grocy account per person** (for example `alice-ia`). Grocy gives new accounts the `ADMIN` permission by default: remove it. Grant only:
 
-`STOCK_PURCHASE`, `STOCK_CONSUME`, `STOCK_INVENTORY`, `STOCK_TRANSFER`, `STOCK_OPEN`, `STOCK_EDIT` (needed to undo), `SHOPPINGLIST_ITEMS_ADD`, `SHOPPINGLIST_ITEMS_DELETE`, `RECIPES`.
+`STOCK_PURCHASE`, `STOCK_CONSUME`, `STOCK_INVENTORY`, `STOCK_TRANSFER`, `STOCK_OPEN`, `STOCK_EDIT` (needed to undo), `SHOPPINGLIST_ITEMS_ADD`, `SHOPPINGLIST_ITEMS_DELETE`, `RECIPES`, `MASTER_DATA_EDIT` (creating products, locations and product groups).
+
+Note: in Grocy, `MASTER_DATA_EDIT` also allows editing and deleting products, locations and product groups — there is no create-only permission. This server exposes no tool that edits or deletes them, but a stolen key of such an account could.
 
 Then create an API key for that account (Grocy → user menu → Manage API keys).
 
