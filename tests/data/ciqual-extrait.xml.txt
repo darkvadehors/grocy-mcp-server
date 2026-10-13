@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="windows-1252" ?>
+<TABLE>
+   <ALIM>
+      <alim_code> 9100 </alim_code>
+      <alim_nom_fr> Riz blanc, cuit, non salé </alim_nom_fr>
+   </ALIM>
+   <ALIM>
+      <alim_code> 9101 </alim_code>
+      <alim_nom_fr> Riz blanc, cru </alim_nom_fr>
+   </ALIM>
+   <ALIM>
+      <alim_code> 13000 </alim_code>
+      <alim_nom_fr> Pomme, pulpe et peau, crue </alim_nom_fr>
+   </ALIM>
+   <ALIM>
+      <alim_code> 5004 </alim_code>
+      <alim_nom_fr> Panaché préemballé (<1° alc.) </alim_nom_fr>
+   </ALIM>
+</TABLE>

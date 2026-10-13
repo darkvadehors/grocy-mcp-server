@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="windows-1252" ?>
+<TABLE>
+<COMPO><alim_code> 9100 </alim_code><const_code> 328 </const_code><teneur> 145 </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 25000 </const_code><teneur> 2,91 </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 31000 </const_code><teneur> 31,7 </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 32000 </const_code><teneur> < 0,5 </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 40000 </const_code><teneur> 0,32 </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 40302 </const_code><teneur> traces </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 34100 </const_code><teneur> - </teneur></COMPO>
+<COMPO><alim_code> 9100 </alim_code><const_code> 10004 </const_code><teneur> 0,0061 </teneur></COMPO>
+<COMPO><alim_code> 9101 </alim_code><const_code> 328 </const_code><teneur> 354 </teneur></COMPO>
+<COMPO><alim_code> 13000 </alim_code><const_code> 328 </const_code><teneur> 53,2 </teneur></COMPO>
+<COMPO><alim_code> 13000 </alim_code><const_code> 400 </const_code><teneur> 85 </teneur></COMPO>
+</TABLE>
