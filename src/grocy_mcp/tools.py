@@ -671,3 +671,28 @@ class ToolService:
             return self._stock_done(caller, tool, rows, f"inventaire de {name} corrigé : {_fmt(current)} → {_fmt(new)}")
 
         return await self._action(caller, tool, {"produit": clean_text(produit), "nouveau": new}, cle_idempotence, run)
+
+    # --- annulation ----------------------------------------------------------------------------------
+    async def annuler_derniere_action(self, caller: Caller) -> dict:
+        last = self.store.last_undo(caller.grocy_user_id)
+        if last is None or last.undone or self.store.now() - last.at > UNDO_WINDOW:
+            return {
+                "statut": "rien_a_annuler",
+                "message": "Aucune action de stock faite via ce connecteur dans les dernières 24 heures n'est à annuler.",
+            }
+
+        async def run(client: GrocyClient) -> dict:
+            rows = await client.transaction(last.transaction_id)
+            if any(int(r.get("user_id", -1)) != caller.grocy_user_id for r in rows):
+                raise ToolFailure("Cette transaction n'appartient pas à ce compte : annulation refusée.")
+            if all(int(r.get("undone") or 0) for r in rows):
+                self.store.mark_undone(last.rowid)
+                return {"statut": "deja_annule", "message": f"Cette action était déjà annulée : {last.summary}."}
+            try:
+                await client.undo(last.transaction_id)
+            except GrocyRequestError as error:
+                raise ToolFailure(f"Annulation impossible : le stock a changé depuis cette action ({error.message}).") from None
+            self.store.mark_undone(last.rowid)
+            return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
+
+        return await self._execute(caller, "annuler_derniere_action", {"transaction": last.transaction_id}, run)
