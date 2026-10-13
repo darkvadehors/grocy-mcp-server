@@ -149,7 +149,7 @@ class FakeGrocy:
         return [
             (r"/api/user", "GET", self._user),
             (r"/api/users", "GET", self._users),
-            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups)", "GET", self._objects),
+            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups|stock|product_barcodes)", "GET", self._objects),
             (r"/api/objects/(products|product_barcodes|locations|product_groups)", "POST", self._create_object),
             (r"/api/stock/barcodes/external-lookup/([^/]+)", "GET", self._external_lookup),
             (r"/api/userfields/products/(\d+)", "GET", self._get_userfields),
@@ -186,6 +186,8 @@ class FakeGrocy:
             "quantity_units": self.quantity_units,
             "recipes": self.recipes,
             "product_groups": self.product_groups,
+            "stock": [{**e, "amount": str(e["amount"])} for e in self.entries],  # Grocy : montants en texte
+            "product_barcodes": [{"product_id": pid, "barcode": code} for code, pid in self.barcodes.items()],
         }[entity]
         return httpx2.Response(200, json=data)
 

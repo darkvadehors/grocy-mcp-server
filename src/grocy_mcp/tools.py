@@ -27,6 +27,8 @@ from grocy_mcp.grocy import (
     GrocyRequestError,
     GrocyUnavailable,
 )
+from grocy_mcp.nutrition import CiqualIndex, check_values, daily_needs
+from grocy_mcp.sources import FoodSources, SourceError
 from grocy_mcp.store import Store, sha256_hex
 
 T = TypeVar("T")
@@ -42,6 +44,17 @@ _BARCODE = re.compile(r"[0-9]{8,14}")
 _PRODUCT_ID = re.compile(r"#?[0-9]{1,7}")
 _PENDING = "__en_cours__"
 _UNCERTAIN = "__incertain__"
+NUTRI_FIELDS = {
+    "kcal": "nutri_kcal_100g",
+    "proteines": "nutri_proteines_100g",
+    "glucides": "nutri_glucides_100g",
+    "sucres": "nutri_sucres_100g",
+    "lipides": "nutri_lipides_100g",
+    "ags": "nutri_ags_100g",
+    "fibres": "nutri_fibres_100g",
+    "sel": "nutri_sel_100g",
+}
+NUTRI_WEIGHT, NUTRI_SOURCE, NUTRI_NON_FOOD = "nutri_poids_unite_g", "nutri_source", "nutri_non_alimentaire"
 _SLOW = object()  # recherche externe trop lente (aperçu d'import)
 UNAVAILABLE = "Grocy ne répond pas pour le moment. Réessayez dans quelques instants."
 
@@ -79,6 +92,28 @@ def _product_ref(product: dict) -> dict:
     return {"id": int(product["id"]), "nom": clean_text(product.get("name"))}
 
 
+def _to_number(value: object) -> float | int | None:
+    """Valeur numérique d'un champ Grocy (texte) ; None si vide ou illisible."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).replace(",", "."))
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number == int(number) else number
+
+
+def _read_key(path) -> str | None:
+    if path is None:
+        return None
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
 def _whole_words(wanted: str, name: str) -> bool:
     """Vrai si `wanted` apparaît dans `name` en mots entiers (« yaourt » dans « yaourt nature », pas « riz » dans « chorizo »)."""
     return bool(wanted) and re.search(rf"(?<!\w){re.escape(wanted)}(?!\w)", name) is not None
@@ -109,12 +144,23 @@ class ToolService:
         box: SecretBox,
         audit: AuditLog,
         grocy_factory: Callable[[str], GrocyClient],
+        *,
+        sources: FoodSources | None = None,
+        ciqual: CiqualIndex | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.box = box
         self.audit = audit
         self.grocy_factory = grocy_factory
+        self.sources = sources or FoodSources(usda_key=_read_key(settings.usda_key_path))
+        self._ciqual = ciqual
+
+    @property
+    def ciqual(self) -> CiqualIndex:
+        if self._ciqual is None:  # chargée au premier usage (≈ 0,5 Mo)
+            self._ciqual = CiqualIndex()
+        return self._ciqual
 
     # --- accès à Grocy avec la clé de la personne --------------------------------------------------
     def _client(self, caller: Caller) -> GrocyClient:
@@ -1174,6 +1220,288 @@ class ToolService:
         audit("creation", type="products", id=pid, nom=step["nom"], code=code)
         step["_pid"] = pid
         return pid, True
+
+    # --- apports nutritionnels et autonomie (spec B) --------------------------------------------------
+    @staticmethod
+    def _nutri(product: dict) -> dict:
+        """Apports d'un produit lus dans ses champs personnalisés (valeurs texte de Grocy → nombres)."""
+        fields = product.get("userfields") or {}
+        values = {}
+        for key, name in NUTRI_FIELDS.items():
+            number = _to_number(fields.get(name))
+            if number is not None:
+                values[key] = number
+        return {
+            "valeurs": values,
+            "poids": _to_number(fields.get(NUTRI_WEIGHT)),
+            "source": clean_text(fields.get(NUTRI_SOURCE) or "", 200) or None,
+            "non_alimentaire": str(fields.get(NUTRI_NON_FOOD) or "") in ("1", "true"),
+        }
+
+    async def _product_with_fields(self, client: GrocyClient, produit: str) -> tuple[str, Any]:
+        status, found = await self._find_product(client, produit)
+        if status != "ok":
+            return status, found
+        return "ok", {**found, "userfields": await client.userfields(int(found["id"]))}
+
+    async def voir_nutrition(self, caller: Caller, produit: str) -> dict:
+        async def run(client: GrocyClient) -> dict:
+            status, product = await self._product_with_fields(client, produit)
+            if status != "ok":
+                return self._unresolved(status, product, produit)
+            data, name = self._nutri(product), clean_text(product["name"])
+            if data["non_alimentaire"]:
+                return {"statut": "non_alimentaire", "produit": name, "message": f"{name} est marqué non alimentaire."}
+            if not data["valeurs"]:
+                return {
+                    "statut": "sans_donnees",
+                    "produit": name,
+                    "message": f"Aucun apport nutritionnel pour {name}. completer_nutrition peut les chercher.",
+                }
+            out = {"statut": "ok", "produit": name, "pour_100g": data["valeurs"], "poids_unite_g": data["poids"], "source": data["source"]}
+            if data["poids"]:
+                out["par_unite"] = {k: round(v * data["poids"] / 100, 2) for k, v in data["valeurs"].items()}
+            return out
+
+        return await self._grocy(caller, run)
+
+    async def _find_nutrition(self, client: GrocyClient, product: dict, codes: list[str]) -> dict:
+        """Proposition pour un produit sans données : Open Food Facts puis USDA par code-barres, sinon Ciqual."""
+        name = clean_text(product["name"])
+        unavailable = False
+        for code in codes:
+            for fetch in (self.sources.off, self.sources.usda):
+                try:
+                    found = await fetch(code)
+                except SourceError:
+                    unavailable = True
+                    continue
+                if not found:
+                    continue
+                reason = check_values(found["valeurs"])
+                if reason:
+                    return {"produit": name, "statut": "refuse", "source": found["source"], "raison": reason}
+                weight = found["poids"]
+                return {
+                    "produit": name,
+                    "statut": "trouve",
+                    "source": found["source"],
+                    "reference": found["reference"],
+                    "nom_source": found["nom"],
+                    "valeurs": found["valeurs"],
+                    "poids_unite_g": weight[0] if weight else None,
+                    "approximatif": bool(weight and weight[1]),
+                }
+        candidates = [
+            {"code": f["code"], "nom": f["nom"], "kcal": f.get("kcal")} for f in self.ciqual.search(name, limit=3)
+        ]
+        message = "Aucune donnée trouvée par code-barres."
+        if unavailable:
+            message = "Source de code-barres momentanément indisponible."
+        if candidates:
+            return {
+                "produit": name,
+                "statut": "choisir_ciqual",
+                "candidats": candidates,
+                "message": f"{message} Choisissez un aliment Ciqual avec la personne, puis appelez definir_nutrition "
+                "avec son code (et poids_unite_g si possible).",
+            }
+        return {"produit": name, "statut": "introuvable", "message": f"{message} Rien dans Ciqual non plus : definir_nutrition(valeurs=…)."}
+
+    async def completer_nutrition(
+        self, caller: Caller, produits: list[str] | None = None, jeton_confirmation: str | None = None
+    ) -> dict:
+        tool = "completer_nutrition"
+        if produits is not None and (not isinstance(produits, list) or len(produits) > MAX_IMPORT):
+            raise ToolFailure(f"produits doit être une liste de {MAX_IMPORT} noms au plus (ou absent : tous).")
+        names = [clean_text(p) for p in produits or []]
+        digest = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode()).hexdigest()
+        if jeton_confirmation:
+            payload = self._take_confirmation(caller, tool, jeton_confirmation)
+            if payload.get("empreinte") != digest:
+                raise ToolFailure("Liste différente de celle de l'aperçu : rien n'a été écrit. Redemandez un aperçu.")
+            return await self._nutrition_confirm(caller, payload["plan"])
+
+        async def preview(client: GrocyClient) -> dict:
+            barcodes: dict[int, list[str]] = {}
+            for row in await client.product_barcodes():
+                barcodes.setdefault(int(row["product_id"]), []).append(str(row["barcode"]))
+            lines, targets = [], []
+            if names:
+                for name in names:
+                    status, product = await self._product_with_fields(client, name)
+                    if status != "ok":
+                        lines.append({"produit": name, **self._unresolved(status, product, name)})
+                    else:
+                        targets.append(product)
+            else:
+                all_products = [p for p in await client.products() if int(p.get("active", 1)) == 1]
+                pending = [p for p in all_products if not self._nutri(p)["valeurs"] and not self._nutri(p)["non_alimentaire"]]
+                targets = pending[:MAX_IMPORT]
+                if len(pending) > MAX_IMPORT:
+                    lines.append({"statut": "suite", "message": f"{len(pending) - MAX_IMPORT} autres produits : rappelez ensuite."})
+            plan = []
+            for product in targets:
+                data = self._nutri(product)
+                if data["valeurs"] or data["non_alimentaire"]:
+                    lines.append({"produit": clean_text(product["name"]), "statut": "deja_renseigne",
+                                  "message": "Déjà renseigné : utilisez definir_nutrition pour modifier."})
+                    continue
+                line = await self._find_nutrition(client, product, barcodes.get(int(product["id"]), []))
+                lines.append(line)
+                if line["statut"] == "trouve":
+                    plan.append({**line, "product_id": int(product["id"])})
+            if not plan:
+                return {"statut": "rien_a_ecrire", "lignes": lines}
+            payload = {"empreinte": digest, "plan": plan}
+            return {
+                "statut": "confirmation_requise",
+                "message": "Aperçu : rien n'a été écrit. Montrez-le à la personne, puis rappelez completer_nutrition avec "
+                "les mêmes produits et jeton_confirmation (5 minutes).",
+                "lignes": lines,
+                "jeton_confirmation": self._new_confirmation(caller, tool, payload),
+            }
+
+        return await self._grocy(caller, preview)
+
+    async def _write_nutrition(
+        self, client: GrocyClient, product_id: int, values: dict, weight: float | None, source: str | None, current: dict
+    ) -> dict:
+        fields: dict[str, object] = {NUTRI_FIELDS[k]: _to_number(v) for k, v in values.items()}  # 145.0 → 145
+        if weight is not None:
+            fields[NUTRI_WEIGHT] = _to_number(weight)
+        if source is not None:
+            fields[NUTRI_SOURCE] = source
+        await client.set_userfields(product_id, fields)
+        kcal = values.get("kcal", current["valeurs"].get("kcal"))
+        grams = weight if weight is not None else current["poids"]
+        if kcal is not None and grams:
+            await client.set_product_calories(product_id, kcal * grams / 100)
+        return fields
+
+    async def _nutrition_confirm(self, caller: Caller, plan: list[dict]) -> dict:
+        async def run(client: GrocyClient) -> dict:
+            results = []
+            for step in plan:
+                current = self._nutri({"userfields": await client.userfields(step["product_id"])})
+                if current["valeurs"] or current["non_alimentaire"]:
+                    results.append({"produit": step["produit"], "resultat": "ignore", "raison": "renseigné entre-temps"})
+                    continue
+                source = f"{step['source']} {step['reference']}" + (" (ml≈g)" if step.get("approximatif") else "")
+                await self._write_nutrition(client, step["product_id"], step["valeurs"], step["poids_unite_g"], source, current)
+                self.audit.write("nutrition", compte_id=caller.grocy_user_id, produit_id=step["product_id"], source=source, valeurs=step["valeurs"])
+                results.append({"produit": step["produit"], "resultat": "ecrit", "poids_connu": step["poids_unite_g"] is not None})
+            done = sum(r["resultat"] == "ecrit" for r in results)
+            return {"statut": "ok" if done else "rien_ecrit", "message": f"Apports écrits pour {done} produit(s).", "lignes": results}
+
+        return await self._execute(caller, "completer_nutrition", {"produits": len(plan), "confirmation": True}, run, count=len(plan))
+
+    async def definir_nutrition(
+        self,
+        caller: Caller,
+        produit: str,
+        ciqual: int | None = None,
+        valeurs: dict | None = None,
+        poids_unite_g: float | None = None,
+        non_alimentaire: bool | None = None,
+        cle_idempotence: str | None = None,
+    ) -> dict:
+        if ciqual is None and valeurs is None and poids_unite_g is None and non_alimentaire is None:
+            raise ToolFailure("Indiquez ciqual, valeurs, poids_unite_g ou non_alimentaire.")
+        new_values: dict = {}
+        source = None
+        if ciqual is not None:
+            food = self.ciqual.get(ciqual) if isinstance(ciqual, int) and not isinstance(ciqual, bool) else None
+            if food is None:
+                raise ToolFailure("Code Ciqual inconnu : reprenez un code proposé par completer_nutrition.")
+            new_values = {k: food[k] for k in NUTRI_FIELDS if k in food}
+            source = clean_text(f"Ciqual {food['code']} — {food['nom']}", 200)
+        if valeurs is not None:
+            if not isinstance(valeurs, dict) or not valeurs or set(valeurs) - set(NUTRI_FIELDS):
+                raise ToolFailure(f"valeurs : clés possibles {', '.join(NUTRI_FIELDS)} (pour 100 g).")
+            new_values.update(valeurs)
+            source = "saisie manuelle" if ciqual is None else source
+        reason = check_values(new_values)
+        if reason:
+            raise ToolFailure(f"Valeurs refusées : {reason}.")
+        if poids_unite_g is not None and (not _is_number(poids_unite_g) or not 1 <= poids_unite_g <= 50_000):  # type: ignore[operator]
+            raise ToolFailure("poids_unite_g doit être compris entre 1 et 50 000 g.")
+        args = {"produit": clean_text(produit), "ciqual": ciqual, "valeurs": new_values or None,
+                "poids_unite_g": poids_unite_g, "non_alimentaire": non_alimentaire}
+
+        async def run(client: GrocyClient) -> dict:
+            status, product = await self._product_with_fields(client, produit)
+            if status != "ok":
+                return self._unresolved(status, product, produit)
+            product_id, name, current = int(product["id"]), clean_text(product["name"]), self._nutri(product)
+            if non_alimentaire is not None:
+                await client.set_userfields(product_id, {NUTRI_NON_FOOD: "1" if non_alimentaire else "0"})
+            if new_values or poids_unite_g is not None:
+                merged = {**current["valeurs"], **new_values}
+                reason = check_values(merged)
+                if reason:
+                    raise ToolFailure(f"Valeurs refusées une fois combinées aux existantes : {reason}.")
+                await self._write_nutrition(client, product_id, new_values, poids_unite_g, source, current)
+            self.audit.write("nutrition", compte_id=caller.grocy_user_id, produit_id=product_id, source=source, valeurs=new_values)
+            return {"statut": "ok", "produit": name, "message": f"Apports de {name} mis à jour."}
+
+        return await self._action(caller, "definir_nutrition", args, cle_idempotence, run)
+
+    async def autonomie_alimentaire(self, caller: Caller, inclure_perimes: bool = False) -> dict:
+        if not self.settings.household:
+            return {
+                "statut": "foyer_non_configure",
+                "message": "Le foyer n'est pas configuré sur le serveur (MCP_HOUSEHOLD) : calcul impossible.",
+            }
+        needs = daily_needs(list(self.settings.household))
+
+        async def run(client: GrocyClient) -> dict:
+            today = datetime.fromtimestamp(self.store.now(), ZoneInfo(self.settings.timezone)).date().isoformat()
+            products = {int(p["id"]): p for p in await client.products()}
+            totals = {"kcal": 0.0, "proteines": 0.0}
+            covered, missing, expired = set(), {}, 0
+            for lot in await client.stock_entries():
+                product = products.get(int(lot["product_id"]))
+                amount = _to_number(lot.get("amount")) or 0
+                if product is None or amount <= 0:
+                    continue
+                data = self._nutri(product)
+                if data["non_alimentaire"]:
+                    continue
+                if not inclure_perimes and str(lot.get("best_before_date") or "9999") < today:
+                    expired += 1
+                    continue
+                if "kcal" not in data["valeurs"] or not data["poids"]:
+                    missing[int(product["id"])] = clean_text(product["name"])
+                    continue
+                covered.add(int(product["id"]))
+                grams = amount * data["poids"]
+                totals["kcal"] += grams * data["valeurs"]["kcal"] / 100
+                totals["proteines"] += grams * data["valeurs"].get("proteines", 0) / 100
+            food = len(covered) + len(missing)
+            coverage = round(100 * len(covered) / food) if food else 0
+            days = {"energie": round(totals["kcal"] / needs["kcal"], 1), "proteines": round(totals["proteines"] / needs["proteines"], 1)}
+            out = {
+                "statut": "ok",
+                "foyer": [f"{'homme' if s == 'H' else 'femme'} {a} ans" for s, a in self.settings.household],
+                "besoins_par_jour": needs,
+                "total": {k: round(v, 1) for k, v in totals.items()},
+                "jours": days,
+                "facteur_limitant": "énergie" if days["energie"] <= days["proteines"] else "protéines",
+                "couverture_pct": coverage,
+                "sans_donnees": [{"id": pid, "nom": name} for pid, name in sorted(missing.items())][:MAX_RESULTS],
+                "perimes_exclus": expired,
+                "message": f"Environ {min(days.values())} jour(s) pour le foyer, d'après les besoins de référence "
+                "(EFSA, activité modérée).",
+            }
+            if coverage < 80:
+                out["avertissement"] = (
+                    f"Seuls {coverage} % des produits alimentaires en stock ont des apports connus : le résultat "
+                    "sous-estime l'autonomie. completer_nutrition peut compléter les autres."
+                )
+            return out
+
+        return await self._grocy(caller, run)
 
 class _SkipLine(Exception):
     """Ligne d'import ignorée à la confirmation (raison destinée à la personne)."""

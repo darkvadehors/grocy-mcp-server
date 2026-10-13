@@ -77,3 +77,12 @@ def test_timezone():
     assert load_settings(env(MCP_TIMEZONE="Europe/Zurich")).timezone == "Europe/Zurich"
     with pytest.raises(ConfigError, match="MCP_TIMEZONE"):
         load_settings(env(MCP_TIMEZONE="Mars/Olympus"))
+
+
+def test_foyer_et_cle_usda():
+    s = load_settings(env())
+    assert s.household == () and s.usda_key_path is None
+    s = load_settings(env(MCP_HOUSEHOLD="H:50,F:54,F:20", MCP_USDA_KEY_FILE="/tmp/usda-key"))
+    assert s.household == (("H", 50), ("F", 54), ("F", 20)) and s.usda_key_path == Path("/tmp/usda-key")
+    with pytest.raises(ConfigError, match="MCP_HOUSEHOLD"):
+        load_settings(env(MCP_HOUSEHOLD="H:12"))

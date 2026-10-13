@@ -9,6 +9,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from grocy_mcp.nutrition import parse_household
+
 
 class ConfigError(Exception):
     """Configuration absente ou invalide."""
@@ -32,6 +34,8 @@ class Settings:
     extra_redirect_uris: tuple[str, ...] = ()
     allowed_origins: tuple[str, ...] = ("https://claude.ai", "https://claude.com", "https://chatgpt.com")
     timezone: str = "UTC"  # fuseau des personnes (dates de péremption « du jour »)
+    household: tuple[tuple[str, int], ...] = ()  # foyer pour l'autonomie alimentaire, ex. (("H", 50), ("F", 54))
+    usda_key_path: Path | None = None  # clé FoodData Central (facultative)
 
     @property
     def resource_url(self) -> str:
@@ -113,6 +117,14 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         except (ZoneInfoNotFoundError, ValueError):
             raise ConfigError("MCP_TIMEZONE : fuseau horaire inconnu") from None
         options["timezone"] = zone
+
+    if env.get("MCP_HOUSEHOLD", "").strip():
+        try:
+            options["household"] = tuple(parse_household(env["MCP_HOUSEHOLD"]))
+        except ValueError as error:
+            raise ConfigError(str(error)) from None
+    if env.get("MCP_USDA_KEY_FILE", "").strip():
+        options["usda_key_path"] = Path(env["MCP_USDA_KEY_FILE"].strip())
 
     return Settings(
         grocy_base_url=_bare_https(env, "GROCY_BASE_URL"),

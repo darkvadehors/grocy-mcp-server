@@ -144,6 +144,13 @@ class GrocyClient:
         )
         return result if isinstance(result, dict) else None
 
+    async def stock_entries(self) -> list[dict]:
+        """Lots en stock (un par entrée, avec sa date de péremption)."""
+        return await self._request("GET", "/api/objects/stock")
+
+    async def product_barcodes(self) -> list[dict]:
+        return await self._request("GET", "/api/objects/product_barcodes")
+
     async def product_groups(self) -> list[dict]:
         return await self._request("GET", "/api/objects/product_groups")
 
