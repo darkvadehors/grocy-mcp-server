@@ -220,3 +220,12 @@ async def test_rechercher_ciqual(nutri):
     assert (await nutri.rechercher_ciqual(JOHNNY, "zzzz"))["candidats"] == []
     with pytest.raises(ToolFailure):
         await nutri.rechercher_ciqual(JOHNNY, "  ")
+
+
+async def test_lot_probable_dans_l_apercu(nutri, fake, off):
+    off["3017620422003"].update(
+        {"product_name": "KITKAT barre 41,5g", "product_quantity": 415, "product_quantity_unit": "g", "serving_quantity": 41.5}
+    )
+    line = (await nutri.completer_nutrition(JOHNNY, ["lait"]))["lignes"][0]
+    assert line["poids_unite_g"] == 415 and "10 × 41,5 g" in line["avertissement"]
+    assert "poids_unite_g=41.5" in line["avertissement"]

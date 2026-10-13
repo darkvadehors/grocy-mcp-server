@@ -17,6 +17,7 @@ from grocy_mcp.nutrition import weight_in_grams
 
 _BARCODE = re.compile(r"[0-9]{8,14}")
 _MULTIPACK = re.compile(r"\d\s*[x×*]\s*\d", re.I)
+_NAME_WEIGHT = re.compile(r"\d+(?:[.,]\d+)?\s*(?:kg|gr|g)\b", re.I)
 OFF_URL = "https://world.openfoodfacts.org/api/v2/product/{code}.json"
 USDA_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 TIMEOUT = 10.0
@@ -79,6 +80,25 @@ def _off_weight(product: dict) -> tuple[float, bool] | None:
     return _metric_weight(product.get("quantity"))
 
 
+def _probable_pack(weight: tuple[float, bool] | None, product: dict) -> tuple[int, float] | None:
+    """Contenance multiple entier de la portion (415 g = 10 × 41,5 g) : paquet de plusieurs unités probable."""
+    serving = _number(product.get("serving_quantity"))
+    if serving is None:
+        match = re.match(r"\s*(\d+(?:[.,]\d+)?)\s*g\b", str(product.get("serving_size") or ""), re.I)
+        serving = _number(match.group(1)) if match else None
+    if not weight or not serving or serving <= 0:
+        return None
+    count = weight[0] / serving
+    if count < 2 or abs(count - round(count)) >= 0.02:
+        return None
+    # Une portion conseillée (riz : 62,5 g) ne fait pas un lot : il faut que le nom indique le poids d'une unité
+    # (« KITKAT barre 41,5g ») et non le poids total (« Riz Noir 500 g »).
+    in_name = [w for w in (_metric_weight(m.group(0)) for m in _NAME_WEIGHT.finditer(str(product.get("product_name") or ""))) if w]
+    if any(abs(w[0] - serving) < 0.01 for w in in_name) and not any(abs(w[0] - weight[0]) < 0.01 for w in in_name):
+        return int(round(count)), _compact(serving)
+    return None
+
+
 class FoodSources:
     def __init__(self, transport: httpx2.AsyncBaseTransport | None = None, usda_key: str | None = None) -> None:
         self._transport = transport
@@ -112,7 +132,7 @@ class FoodSources:
         data = await self._get_json(
             OFF_URL.format(code=code),
             # « quantity » est indispensable : sans lui, Open Food Facts omet product_quantity quand nutriments est demandé
-            params={"fields": "product_name,quantity,product_quantity,product_quantity_unit,nutriments"},
+            params={"fields": "product_name,quantity,product_quantity,product_quantity_unit,serving_size,serving_quantity,nutriments"},
         )
         product = data.get("product") if isinstance(data, dict) and data.get("status") == 1 else None
         if not isinstance(product, dict):
@@ -129,12 +149,14 @@ class FoodSources:
                 values["kcal"] = round(kj / 4.184)
         if not values:
             return None
+        weight = _off_weight(product)
         return {
             "source": "Open Food Facts",
             "reference": code,
             "nom": _clean(product.get("product_name")),
             "valeurs": values,
-            "poids": _off_weight(product),
+            "poids": weight,
+            "lot": _probable_pack(weight, product),
         }
 
     async def usda(self, code: str) -> dict | None:

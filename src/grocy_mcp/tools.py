@@ -1306,9 +1306,20 @@ class ToolService:
                 }
                 if weight is None:
                     line["message"] = "Poids d'une unité inconnu : à fixer avec definir_nutrition(poids_unite_g=…)."
+                warnings = []
+                pack = found.get("lot")
+                if pack and not per_unit:
+                    portion = _fmt(pack[1])
+                    warnings.append(
+                        f"Lot probable : {weight[0]} g = {pack[0]} × {portion} g. Le poids retenu est celui du paquet entier ; "
+                        f"si le stock est compté à l'unité, demandez à la personne puis appelez "
+                        f"definir_nutrition(poids_unite_g={pack[1]})."
+                    )
                 calories = _to_number(product.get("calories"))
                 if calories:
-                    line["avertissement"] = f"L'énergie saisie dans Grocy ({calories} kcal par unité) sera remplacée."
+                    warnings.append(f"L'énergie saisie dans Grocy ({calories} kcal par unité) sera remplacée.")
+                if warnings:
+                    line["avertissement"] = " ".join(warnings)
                 return line
         candidates = [
             {"code": f["code"], "nom": f["nom"], "kcal": f.get("kcal")} for f in self.ciqual.search(name, limit=3)

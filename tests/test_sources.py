@@ -146,3 +146,25 @@ async def test_r_c2_lot_jamais_devine_meme_avec_product_quantity():
     product["product"].update({"product_quantity": None, "quantity": "500 gr"})
     t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
     assert (await FoodSources(transport=t).off("3017620422003"))["poids"] == (500, False)
+
+
+@pytest.mark.parametrize(
+    ("name", "quantity", "serving", "lot"),
+    [
+        ("KITKAT barre chocolatée 41,5g", 415, {"serving_quantity": 41.5}, (10, 41.5)),
+        ("KITKAT barre 41.5 g", 415, {"serving_size": "41.5 g ((41.5 g))"}, (10, 41.5)),
+        ("Yaourt 125g", 500, {"serving_quantity": 125}, (4, 125)),
+        ("Riz Noir 500 g", 500, {"serving_quantity": 62.5}, None),  # portion conseillée, pas un lot
+        ("Riz Noir", 500, {"serving_quantity": 62.5}, None),
+        ("Biscuits 30 g", 400, {"serving_quantity": 30}, None),  # pas un multiple entier
+        ("Pâtes 100 g", 100, {"serving_quantity": 100}, None),
+    ],
+)
+async def test_lot_probable_detecte(name, quantity, serving, lot):
+    """Lot probable seulement si le nom indique le poids d'une portion (KitKat : « 41,5g », 415 g = 10 × 41,5 g)."""
+    product = json.loads(json.dumps(OFF_PRODUCT))
+    product["product"].update(
+        {"product_name": name, "product_quantity": quantity, "product_quantity_unit": "g", "quantity": f"{quantity} g", **serving}
+    )
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
+    assert (await FoodSources(transport=t).off("3017620422003")).get("lot") == lot
