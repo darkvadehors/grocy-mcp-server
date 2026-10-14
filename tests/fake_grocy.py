@@ -14,6 +14,7 @@ import httpx2
 KEY_JOHNNY_IA = "jia" + "1" * 47
 KEY_ELLI_IA = "eia" + "2" * 47
 KEY_ADMIN = "adm" + "3" * 47
+KEY_AUTO = "aut" + "4" * 47
 TODAY = date(2026, 10, 13)
 IA_PERMISSIONS = frozenset(
     {
@@ -52,6 +53,7 @@ class FakeGrocy:
             KEY_JOHNNY_IA: FakeUser(3, "johnny-ia"),
             KEY_ELLI_IA: FakeUser(4, "elli-ia"),
             KEY_ADMIN: FakeUser(1, "johnny", admin=True),
+            KEY_AUTO: FakeUser(9, "auto-ia", permissions={"MASTER_DATA_EDIT"}),
         }
         self.products = {
             1: {"id": 1, "name": "Lait demi-écrémé", "location_id": 1, "qu_id_stock": 1, "active": 1},
@@ -64,6 +66,8 @@ class FakeGrocy:
         self.locations = [{"id": 1, "name": "Frigo"}, {"id": 2, "name": "Placard"}]
         self.quantity_units = [{"id": 1, "name": "Pièce", "name_plural": "Pièces"}]
         self.product_groups: list[dict] = []
+        self.conversions: list[dict] = []  # quantity_unit_conversions (product_id None : conversion générale)
+        self.fail_conversion_for: int | None = None  # produit dont la création de conversion échoue
         # Champs personnalisés des produits (créés en production par grocy_nutrition_fields.py)
         self.userfield_names = {
             "nutri_kcal_100g", "nutri_proteines_100g", "nutri_glucides_100g", "nutri_sucres_100g", "nutri_lipides_100g",
@@ -149,8 +153,8 @@ class FakeGrocy:
         return [
             (r"/api/user", "GET", self._user),
             (r"/api/users", "GET", self._users),
-            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups|stock|product_barcodes)", "GET", self._objects),
-            (r"/api/objects/(products|product_barcodes|locations|product_groups)", "POST", self._create_object),
+            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups|stock|product_barcodes|quantity_unit_conversions)", "GET", self._objects),
+            (r"/api/objects/(products|product_barcodes|locations|product_groups|quantity_unit_conversions)", "POST", self._create_object),
             (r"/api/stock/barcodes/external-lookup/([^/]+)", "GET", self._external_lookup),
             (r"/api/userfields/products/(\d+)", "GET", self._get_userfields),
             (r"/api/userfields/products/(\d+)", "PUT", self._put_userfields),
@@ -188,6 +192,7 @@ class FakeGrocy:
             "product_groups": self.product_groups,
             "stock": [{**e, "amount": str(e["amount"])} for e in self.entries],  # Grocy : montants en texte
             "product_barcodes": [{"product_id": pid, "barcode": code} for code, pid in self.barcodes.items()],
+            "quantity_unit_conversions": self.conversions,
         }[entity]
         return httpx2.Response(200, json=data)
 
@@ -219,6 +224,18 @@ class FakeGrocy:
 
     # --- données de base (Grocy 4.7.1 : MASTER_DATA_EDIT, noms uniques) ---------------------------
     def _insert(self, entity: str, data: dict) -> tuple[int | None, httpx2.Response | None]:
+        if entity == "quantity_unit_conversions":
+            units = {u["id"] for u in self.quantity_units}
+            pid = data.get("product_id")
+            if data.get("from_qu_id") not in units or data.get("to_qu_id") not in units:
+                return None, _err(400, "FOREIGN KEY constraint failed")
+            if pid is not None and (int(pid) not in self.products or int(pid) == self.fail_conversion_for):
+                return None, _err(400, "product_id does not reference an existing product")
+            if any(c.get("product_id") == pid and c["from_qu_id"] == data["from_qu_id"] and c["to_qu_id"] == data["to_qu_id"] for c in self.conversions):
+                return None, _err(400, "UNIQUE constraint failed: quantity_unit_conversions")
+            new_id = next(self._ids)
+            self.conversions.append({**data, "id": new_id})
+            return new_id, None
         if entity == "product_barcodes":
             if data.get("barcode") in self.barcodes:
                 return None, _err(400, "UNIQUE constraint failed: product_barcodes.barcode")

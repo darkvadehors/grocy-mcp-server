@@ -67,6 +67,12 @@ def fold(text: str) -> str:
     return " ".join(text.split())
 
 
+def clean_name(value: object, limit: int = 120) -> str:
+    """Nom lisible pour un rapport : sans caractères de contrôle ni invisibles (U+FFFC d'un copier-coller iOS)."""
+    text = "".join(c for c in str(value or "") if unicodedata.category(c)[0] != "C" and c != "\ufffc")
+    return " ".join(text.split())[:limit]
+
+
 def metric_kind(unit_name: str) -> tuple[str, float] | None:
     """(« mass » ou « volume », valeur d'une unité en g ou en mL), ou None pour une unité de comptage."""
     return _METRIC.get(fold(unit_name))

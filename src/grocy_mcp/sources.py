@@ -159,6 +159,21 @@ class FoodSources:
             "lot": _probable_pack(weight, product),
         }
 
+    async def off_quantity(self, code: str) -> str | None:
+        """Contenance déclarée sur Open Food Facts (« 250 g », « 6 x 27,5 cl »), ou None si inconnue."""
+        if not _BARCODE.fullmatch(code or ""):
+            raise SourceError("code-barres invalide")
+        data = await self._get_json(OFF_URL.format(code=code), params={"fields": "quantity,product_quantity,product_quantity_unit"})
+        product = data.get("product") if isinstance(data, dict) and data.get("status") == 1 else None
+        if not isinstance(product, dict):
+            return None
+        text = _clean(product.get("quantity"), 60)
+        if text:
+            return text
+        amount = _number(product.get("product_quantity"))
+        unit = _clean(product.get("product_quantity_unit"), 10) or "g"
+        return f"{_compact(amount)} {unit}" if amount is not None and amount > 0 else None
+
     async def usda(self, code: str) -> dict | None:
         if not self._usda_key:
             return None

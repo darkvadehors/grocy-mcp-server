@@ -132,7 +132,7 @@ class GrocyClient:
         await self._request("GET", "/api/users")
 
     # --- données de base (permission Grocy MASTER_DATA_EDIT) -------------------------------------
-    _CREATABLE = frozenset({"products", "product_barcodes", "locations", "product_groups"})
+    _CREATABLE = frozenset({"products", "product_barcodes", "locations", "product_groups", "quantity_unit_conversions"})
 
     async def external_lookup(self, code: str, add: bool = False) -> dict | None:
         """Recherche du plugin multi-sources ; add=True crée le produit et son code-barres dans Grocy."""
@@ -162,6 +162,16 @@ class GrocyClient:
         if isinstance(created, str) and created.isdigit():  # Grocy renvoie l'identifiant en texte (PDO lastInsertId)
             created = int(created)
         return _int_id(created)
+
+    async def quantity_unit_conversions(self) -> list[dict]:
+        """Conversions d'unités saisies (product_id vide : conversion générale, sinon propre au produit)."""
+        return await self._request("GET", "/api/objects/quantity_unit_conversions")
+
+    async def set_purchase_unit(self, product_id: int, qu_id: int) -> None:
+        """Unité d'achat et de prix d'un produit (conditionnement : produit vendu au poids, acheté au paquet)."""
+        await self._request(
+            "PUT", f"/api/objects/products/{_int_id(product_id)}", body={"qu_id_purchase": _int_id(qu_id), "qu_id_price": _int_id(qu_id)}
+        )
 
     # --- champs personnalisés et énergie (apports nutritionnels, spec B) ---------------------------
     async def userfields(self, product_id: int) -> dict:

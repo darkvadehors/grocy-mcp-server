@@ -69,7 +69,7 @@ def _required(env: Mapping[str, str], name: str) -> str:
     return value
 
 
-def _bare_https(env: Mapping[str, str], name: str) -> str:
+def bare_https(env: Mapping[str, str], name: str) -> str:
     value = _required(env, name).rstrip("/")
     parts = urlsplit(value)
     if parts.scheme != "https" or not parts.hostname:
@@ -127,8 +127,8 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         options["usda_key_path"] = Path(env["MCP_USDA_KEY_FILE"].strip())
 
     return Settings(
-        grocy_base_url=_bare_https(env, "GROCY_BASE_URL"),
-        public_url=_bare_https(env, "MCP_PUBLIC_URL"),
+        grocy_base_url=bare_https(env, "GROCY_BASE_URL"),
+        public_url=bare_https(env, "MCP_PUBLIC_URL"),
         db_path=Path(_required(env, "MCP_DB_PATH")),
         audit_path=Path(_required(env, "MCP_AUDIT_PATH")),
         key_path=key_path,
