@@ -5,7 +5,7 @@ import pytest
 
 from grocy_mcp.audit import AuditLog
 from grocy_mcp.grocy import GrocyClient
-from grocy_mcp.packaging_job import OffCache, run_packaging
+from grocy_mcp.packaging_job import JobState, OffCache, run_packaging
 from grocy_mcp.sources import FoodSources
 from tests.fake_grocy import KEY_AUTO, FakeGrocy
 
@@ -61,7 +61,13 @@ def client(fake):
 
 
 def own(fake, pid):
-    return sorted((c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions if c.get("product_id") == pid)
+    """Conversions propres au produit, sans les inverses que Grocy ajoute de lui-même."""
+    rows = [c for c in fake.conversions if c.get("product_id") == pid]
+    firsts = []
+    for c in sorted(rows, key=lambda c: c["id"]):
+        if not any(f[0] == c["to_qu_id"] and f[1] == c["from_qu_id"] for f in firsts):
+            firsts.append((c["from_qu_id"], c["to_qu_id"], c["factor"]))
+    return sorted(firsts)
 
 
 async def test_run_writes_only_certain_contents(grocy, sources, tmp_path):
@@ -191,3 +197,28 @@ async def test_off_lookups_are_capped_per_pass(grocy, sources, off_calls, monkey
     report = await run_packaging(client(grocy), sources, OffCache(None))
     statuses = {line["produit"]: line["statut"] for line in report["produits"]}
     assert len(off_calls) == 1 and statuses["Morceaux de noix"] == "reporte"
+
+
+async def test_removed_conversion_is_never_recreated(grocy, sources, tmp_path):
+    """Une contenance écrite par le passage puis supprimée par la personne n'est jamais recréée."""
+    state = JobState(tmp_path / "traites.json")
+    await run_packaging(client(grocy), sources, OffCache(None), state=state)
+    assert own(grocy, 1) == [(1, 3, 500)]
+    grocy.conversions = [c for c in grocy.conversions if c.get("product_id") != 1]  # supprimée dans Grocy
+    report = await run_packaging(client(grocy), sources, OffCache(None), state=JobState(tmp_path / "traites.json"))
+    assert own(grocy, 1) == []
+    assert {line["produit"]: line["statut"] for line in report["produits"]}["Riz noir 500 g"] == "retire"
+
+
+async def test_ignored_products_are_left_alone(grocy, sources, tmp_path):
+    state = JobState(tmp_path / "traites.json")
+    state.ignore([1])
+    report = await run_packaging(client(grocy), sources, OffCache(None), state=state)
+    assert own(grocy, 1) == [] and {line["produit"]: line["statut"] for line in report["produits"]}["Riz noir 500 g"] == "retire"
+    assert JobState(tmp_path / "traites.json").done == {1, 2}  # mémorisé (fichier) : 1 ignoré, 2 écrit
+
+
+async def test_dry_run_does_not_remember(grocy, sources, tmp_path):
+    state = JobState(tmp_path / "traites.json")
+    await run_packaging(client(grocy), sources, OffCache(None), state=state, dry_run=True)
+    assert JobState(tmp_path / "traites.json").done == set()

@@ -36,6 +36,7 @@ class Settings:
     timezone: str = "UTC"  # fuseau des personnes (dates de péremption « du jour »)
     household: tuple[tuple[str, int], ...] = ()  # foyer pour l'autonomie alimentaire, ex. (("H", 50), ("F", 54))
     usda_key_path: Path | None = None  # clé FoodData Central (facultative)
+    packaging_done_path: Path | None = None  # produits traités par le conditionnement automatique (lecture seule)
 
     @property
     def resource_url(self) -> str:
@@ -125,6 +126,8 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
             raise ConfigError(str(error)) from None
     if env.get("MCP_USDA_KEY_FILE", "").strip():
         options["usda_key_path"] = Path(env["MCP_USDA_KEY_FILE"].strip())
+    if env.get("MCP_PACKAGING_DONE", "").strip():
+        options["packaging_done_path"] = Path(env["MCP_PACKAGING_DONE"].strip())
 
     return Settings(
         grocy_base_url=bare_https(env, "GROCY_BASE_URL"),

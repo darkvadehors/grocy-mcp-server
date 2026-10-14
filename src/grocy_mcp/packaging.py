@@ -184,12 +184,14 @@ def plan_product(
     if fresh.status != "a_ecrire":
         return Decision("deja")
     planned = {(a, b): f for a, b, f in fresh.conversions}
+    planned.update({(b, a): 1 / f for a, b, f in fresh.conversions})  # Grocy ajoute lui-même l'inverse de chaque conversion
     for row in own:
         key = (int(row["from_qu_id"]), int(row["to_qu_id"]))
         factor = planned.get(key)
         if factor is None or abs(float(row["factor"]) - factor) > TOLERANCE * max(factor, 1e-9):
             return Decision("deja")
     done = {(int(r["from_qu_id"]), int(r["to_qu_id"])) for r in own}
+    done |= {(b, a) for a, b in done}
     remaining = [c for c in fresh.conversions if (c[0], c[1]) not in done]
     if not remaining and fresh.purchase_unit is None:
         return Decision("deja")

@@ -68,6 +68,7 @@ class FakeGrocy:
         self.product_groups: list[dict] = []
         self.conversions: list[dict] = []  # quantity_unit_conversions (product_id None : conversion générale)
         self.fail_conversion_for: int | None = None  # produit dont la création de conversion échoue
+        self.auto_inverse_ids: set[int] = set()  # conversions inverses ajoutées par Grocy lui-même
         self.fail_second_conversion_for: int | None = None  # produit dont la 2e conversion échoue (écriture partielle)
         # Champs personnalisés des produits (créés en production par grocy_nutrition_fields.py)
         self.userfield_names = {
@@ -116,6 +117,10 @@ class FakeGrocy:
         }
         self.entries.append(entry)
         return entry
+
+    def written_conversions(self) -> list[dict]:
+        """Conversions créées par les appels, sans les inverses que Grocy ajoute de lui-même."""
+        return [c for c in self.conversions if c["id"] not in self.auto_inverse_ids]
 
     def amount(self, product_id: int) -> float:
         return sum(e["amount"] for e in self.entries if e["product_id"] == product_id)
@@ -238,6 +243,11 @@ class FakeGrocy:
                 return None, _err(400, "UNIQUE constraint failed: quantity_unit_conversions")
             new_id = next(self._ids)
             self.conversions.append({**data, "id": new_id})
+            # Grocy 4.7.1 crée aussi la conversion inverse (constaté en production le 2026-10-14)
+            if not any(c.get("product_id") == pid and c["from_qu_id"] == data["to_qu_id"] and c["to_qu_id"] == data["from_qu_id"] for c in self.conversions):
+                self.auto_inverse_ids.add(new_inverse := next(self._ids))
+                self.conversions.append({"product_id": pid, "from_qu_id": data["to_qu_id"], "to_qu_id": data["from_qu_id"],
+                                         "factor": 1 / float(data["factor"]), "id": new_inverse})
             return new_id, None
         if entity == "product_barcodes":
             if data.get("barcode") in self.barcodes:

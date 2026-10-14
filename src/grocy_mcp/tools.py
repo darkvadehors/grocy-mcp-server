@@ -29,7 +29,7 @@ from grocy_mcp.grocy import (
 )
 from grocy_mcp.nutrition import CiqualIndex, check_values, daily_needs
 from grocy_mcp.packaging import metric_kind, own_conversions, resolve_unit
-from grocy_mcp.packaging_job import OffCache, decide, describe, load_catalog, needs_lookup
+from grocy_mcp.packaging_job import JobState, OffCache, decide, describe, load_catalog, needs_lookup
 from grocy_mcp.sources import FoodSources, SourceError
 from grocy_mcp.store import Store, sha256_hex
 
@@ -1522,6 +1522,8 @@ class ToolService:
         "unite_absente": "unité de contenance absente de Grocy : créez-la, ou précisez avec definir_conditionnement",
         "unite_stock": "l'unité de stock n'est pas un emballage (tranche, portion…) : précisez avec definir_conditionnement",
         "reporte": "Open Food Facts pas encore consulté : examiné au prochain passage automatique",
+        "retire": "contenance retirée ou écartée à la main : le passage automatique n'y touche plus "
+        "(definir_conditionnement reste possible)",
     }
     MAX_PACKAGING_LOOKUPS = 20  # appels à Open Food Facts par appel de l'outil (délai de réponse borné)
 
@@ -1530,10 +1532,15 @@ class ToolService:
 
         async def run(client: GrocyClient) -> dict:
             products, units, conversions, codes = await load_catalog(client)
+            done = JobState(self.settings.packaging_done_path).done if self.settings.packaging_done_path else set()
             lines, lookups = [], 0
             for product in products:
                 pid = int(product["id"])
                 own = codes.get(pid, [])
+                if pid in done and not own_conversions(pid, conversions):
+                    lines.append({"produit": clean_text(product["name"]), "id": pid, "statut": "retire",
+                                  "explication": self._PACKAGING_HELP["retire"]})
+                    continue
                 if needs_lookup(product, conversions, own, self._off_cache):
                     if lookups >= self.MAX_PACKAGING_LOOKUPS:  # jamais décidé sans Open Food Facts (revue M2)
                         lines.append({"produit": clean_text(product["name"]), "id": pid, "statut": "reporte",

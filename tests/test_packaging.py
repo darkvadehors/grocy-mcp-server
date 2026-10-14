@@ -157,6 +157,13 @@ def test_plan_completes_its_own_partial_write():
     assert finished.status == "deja"
 
 
+def test_plan_completes_despite_grocy_inverse_rows():
+    """Grocy ajoute l'inverse de chaque conversion : elle compte comme écrite par le passage."""
+    partial = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}, {"product_id": 1, "from_qu_id": 1, "to_qu_id": 8, "factor": 4}]
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))])
+    assert decision.status == "a_ecrire" and decision.conversions == [(2, 1, 0.25)]
+
+
 def test_plan_stock_unit_that_is_not_a_package():
     """I5 : un produit stocké à la tranche ne reçoit jamais « 1 Tranche = contenance du paquet »."""
     units = {**UNITS, 10: "Tranche"}

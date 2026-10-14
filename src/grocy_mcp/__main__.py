@@ -117,7 +117,7 @@ def _packaging(args: argparse.Namespace) -> int:
     from grocy_mcp.audit import AuditLog
     from grocy_mcp.config import ConfigError, bare_https
     from grocy_mcp.grocy import GrocyAuthError, GrocyForbidden, GrocyUnavailable
-    from grocy_mcp.packaging_job import OffCache, run_packaging
+    from grocy_mcp.packaging_job import JobState, OffCache, run_packaging
     from grocy_mcp.redact import install_redaction
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
@@ -131,10 +131,20 @@ def _packaging(args: argparse.Namespace) -> int:
         raise SystemExit("clé auto-ia introuvable : CREDENTIALS_DIRECTORY (auto-key) ou MCP_AUTO_KEY_FILE")
     key = key_path.read_text(encoding="utf-8").strip()
     cache = OffCache(_env_path("MCP_PACKAGING_STATE", "STATE_DIRECTORY", "off-cache.json"))
+    state = JobState(_env_path("MCP_PACKAGING_DONE", "STATE_DIRECTORY", "traites.json"))
+    if args.ignorer:
+        try:
+            ids = [int(part) for part in args.ignorer.split(",") if part.strip()]
+        except ValueError:
+            raise SystemExit("--ignorer : identifiants de produits séparés par des virgules (ex. 6,12)") from None
+        state.ignore(ids)
+        print(f"{len(ids)} produit(s) écarté(s) du conditionnement automatique")
     audit_path = _env_path("MCP_PACKAGING_AUDIT", "LOGS_DIRECTORY", "conditionnement.jsonl")
     audit = AuditLog(audit_path) if audit_path and not args.dry_run else None
     try:
-        report = asyncio.run(run_packaging(_make_client(base_url, key), _make_sources(), cache, dry_run=args.dry_run, audit=audit))
+        report = asyncio.run(run_packaging(
+            _make_client(base_url, key), _make_sources(), cache, dry_run=args.dry_run, audit=audit, state=state
+        ))
     except GrocyAuthError:
         print("clé auto-ia refusée par Grocy (révoquée ?)", file=sys.stderr)
         return 2
@@ -171,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     rotate.set_defaults(handler=_rotate_key)
     packaging = commands.add_parser("conditionner", help="conditionnement automatique des produits (compte auto-ia)")
     packaging.add_argument("--dry-run", action="store_true", help="afficher sans rien écrire")
+    packaging.add_argument("--ignorer", help="identifiants de produits à ne jamais conditionner (ex. 6,12)")
     packaging.set_defaults(handler=_packaging)
     args = parser.parse_args(argv)
     return args.handler(args)

@@ -53,7 +53,7 @@ async def test_voir_conditionnements_manquants(pack, fake):
 async def test_definir_conditionnement_paquet(pack, fake, settings):
     out = await pack.definir_conditionnement(JOHNNY, "noix", 250, "g", par="Paquet")
     assert out["statut"] == "ok" and "1 Paquet = 250 Gramme" in out["message"]
-    assert [(c["product_id"], c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions] == [(7, 6, 2, 250)]
+    assert [(c["product_id"], c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.written_conversions()] == [(7, 6, 2, 250)]
     events = [json.loads(line) for line in settings.audit_path.read_text().splitlines()]
     written = [e for e in events if e["event"] == "conditionnement"]
     assert len(written) == 1 and written[0]["compte_id"] == 3 and written[0]["produit_id"] == 7
@@ -62,14 +62,14 @@ async def test_definir_conditionnement_paquet(pack, fake, settings):
 async def test_definir_conditionnement_lot(pack, fake):
     await pack.definir_conditionnement(JOHNNY, "tourtel", 6, "bouteilles", par="pack")
     await pack.definir_conditionnement(JOHNNY, "tourtel", 27.5, "cl")  # par défaut : l'unité de stock (Bouteille)
-    assert sorted((c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions) == [(3, 4, 6), (4, 5, 27.5)]
+    assert sorted((c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.written_conversions()) == [(3, 4, 6), (4, 5, 27.5)]
 
 
 async def test_definir_conditionnement_existant(pack, fake):
     await pack.definir_conditionnement(JOHNNY, "noix", 250, "g", par="Paquet")
     # nouvelle clé d'idempotence : sinon la même demande dans les 10 minutes renvoie simplement le premier résultat
     same = await pack.definir_conditionnement(JOHNNY, "noix", 250, "g", par="Paquet", cle_idempotence="k2")
-    assert same["statut"] == "existe_deja" and len(fake.conversions) == 1
+    assert same["statut"] == "existe_deja" and len(fake.written_conversions()) == 1
     with pytest.raises(ToolFailure, match="existe déjà"):
         await pack.definir_conditionnement(JOHNNY, "noix", 200, "g", par="Paquet", cle_idempotence="k3")
 
@@ -99,7 +99,7 @@ async def test_definir_conditionnement_produit_ambigu(pack, fake):
 async def test_definir_conditionnement_par_defaut_unite_de_stock(pack, fake):
     fake.products[8] = {"id": 8, "name": "Riz noir", "location_id": 2, "qu_id_stock": 1, "qu_id_purchase": 1, "active": 1}
     await pack.definir_conditionnement(JOHNNY, "riz noir", 500, "g")
-    assert [(c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions] == [(1, 2, 500)]
+    assert [(c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.written_conversions()] == [(1, 2, 500)]
 
 
 async def test_definir_conditionnement_refuse_deux_unites_metriques(pack, fake):
@@ -120,4 +120,17 @@ async def test_definir_conditionnement_refuse_une_contradiction(pack, fake):
         await pack.definir_conditionnement(JOHNNY, "riz noir", 1, "kg")
     with pytest.raises(ToolFailure, match="existe déjà"):
         await pack.definir_conditionnement(JOHNNY, "riz noir", 0.002, "Pièce", par="g")
-    assert len(fake.conversions) == 1
+    assert len(fake.written_conversions()) == 1
+
+
+async def test_voir_conditionnements_respecte_les_produits_retires(pack, fake, tmp_path):
+    """Un produit écarté ou dont la contenance a été retirée n'est pas annoncé « réglé automatiquement »."""
+    import dataclasses
+
+    from grocy_mcp.packaging_job import JobState
+
+    JobState(tmp_path / "traites.json").ignore([5])
+    pack.settings = dataclasses.replace(pack.settings, packaging_done_path=tmp_path / "traites.json")
+    out = await pack.voir_conditionnements_manquants(JOHNNY)
+    line = {line["produit"]: line for line in out["produits"]}["Pâtes 500 g"]
+    assert line["statut"] == "retire" and "definir_conditionnement" in line["explication"]

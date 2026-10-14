@@ -89,7 +89,7 @@ def test_conditionner(tmp_path, monkeypatch, capsys):
     assert main(["conditionner", "--dry-run"]) == 0
     assert fake.conversions == [] and not (tmp_path / "conditionnement.jsonl").exists()
     assert main(["conditionner"]) == 0
-    assert [(c["product_id"], c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions] == [(5, 1, 2, 500)]
+    assert [(c["product_id"], c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.written_conversions()] == [(5, 1, 2, 500)]
     out = capsys.readouterr().out
     assert "1 produit(s) conditionné(s)" in out and "Pâtes 500 g" in out and KEY_AUTO not in out
     assert (tmp_path / "conditionnement.jsonl").exists()

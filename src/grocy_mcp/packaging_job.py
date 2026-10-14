@@ -57,6 +57,40 @@ class OffCache:
         os.replace(tmp, self.path)
 
 
+class JobState:
+    """Produits déjà traités par le passage (écrits ou écartés à la main) : une contenance écrite puis supprimée par
+    une personne n'est jamais recréée."""
+
+    def __init__(self, path: Path | str | None) -> None:
+        self.path = Path(path) if path else None
+        self.done: set[int] = set()
+        if self.path and self.path.exists():
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            ids = data.get("traites") if isinstance(data, dict) else None
+            self.done = {int(i) for i in ids if isinstance(i, int) and not isinstance(i, bool)} if isinstance(ids, list) else set()
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        tmp = self.path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"traites": sorted(self.done)}, f)
+        os.replace(tmp, self.path)
+
+    def mark(self, product_id: int) -> None:
+        if int(product_id) not in self.done:
+            self.done.add(int(product_id))
+            self._save()
+
+    def ignore(self, product_ids: list[int]) -> None:
+        self.done |= {int(i) for i in product_ids}
+        self._save()
+
+
 async def _off_quantity(sources: FoodSources, cache: OffCache, code: str) -> str | None:
     known, quantity = cache.get(code)
     if known:
@@ -133,6 +167,7 @@ async def run_packaging(
     *,
     dry_run: bool = False,
     audit: AuditLog | None = None,
+    state: JobState | None = None,
 ) -> dict:
     """Écrit les conversions certaines ; ne touche ni au stock, ni aux noms, ni aux conversions existantes (C6)."""
     products, units, conversions, codes = await load_catalog(client)
@@ -141,6 +176,10 @@ async def run_packaging(
     for product in products:
         pid, name = int(product["id"]), clean_name(product.get("name"))
         codes_of = codes.get(pid, [])
+        if state is not None and pid in state.done and not own_conversions(pid, conversions):
+            # déjà traité et plus aucune conversion : retirée ou écartée par une personne, jamais recréée
+            lines.append({"produit": name, "statut": "retire", "source": None, "contenance": None})
+            continue
         if sources is not None and needs_lookup(product, conversions, codes_of, cache):
             if lookups >= MAX_LOOKUPS_PER_PASS:
                 lines.append({"produit": name, "statut": "reporte", "source": None, "contenance": None})
@@ -160,13 +199,18 @@ async def run_packaging(
                 if decision.purchase_unit is not None:
                     await client.set_purchase_unit(pid, decision.purchase_unit)
             except GrocyError as error:
-                if created and audit is not None:  # écriture interrompue : tracée, complétée au prochain passage
-                    audit.write("conditionnement_partiel", compte_id=account, produit_id=pid, conversions=created)
+                if created:  # écriture interrompue : tracée, complétée au prochain passage
+                    if state is not None:
+                        state.mark(pid)
+                    if audit is not None:
+                        audit.write("conditionnement_partiel", compte_id=account, produit_id=pid, conversions=created)
                 if not isinstance(error, GrocyRequestError):
                     raise  # clé refusée ou Grocy injoignable : tout le passage s'arrête
                 status = "erreur"  # les autres produits continuent
             else:
                 status, written = "ecrit", written + 1
+                if state is not None:
+                    state.mark(pid)
                 if audit is not None:
                     audit.write(
                         "conditionnement", compte_id=account, produit_id=pid, source=decision.source,
@@ -177,4 +221,4 @@ async def run_packaging(
     return {"ecrits": written, "produits": lines}
 
 
-__all__ = ["AMBIGUOUS", "OffCache", "decide", "describe", "load_catalog", "needs_lookup", "run_packaging"]
+__all__ = ["AMBIGUOUS", "OffCache", "decide", "describe", "load_catalog", "JobState", "needs_lookup", "run_packaging"]
