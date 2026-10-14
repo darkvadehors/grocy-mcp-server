@@ -138,3 +138,56 @@ async def test_inactive_products_are_ignored(grocy, sources):
     grocy.products[1]["active"] = 0
     report = await run_packaging(client(grocy), sources, OffCache(None))
     assert "Riz noir 500 g" not in {line["produit"] for line in report["produits"]}
+
+
+async def test_nutrition_weight_never_used_for_a_weighed_product(grocy, sources):
+    """C1 de la revue : produit stocké en g ou kg, poids nutrition = 1 g ou 1000 g par unité : jamais « 1 Paquet = 1 g »."""
+    grocy.userfield_values[4] = {"nutri_poids_unite_g": "1"}
+    grocy.userfield_values[2] = {"nutri_poids_unite_g": "1000"}
+    grocy.barcodes = {}
+    report = await run_packaging(client(grocy), sources, OffCache(None))
+    assert own(grocy, 4) == [] and own(grocy, 2) == []
+    statuses = {line["produit"]: line["statut"] for line in report["produits"]}
+    assert statuses["Morceaux de noix"] == "inconnu" and statuses["Graines de courge"] == "inconnu"
+
+
+async def test_partial_write_is_audited_and_completed(grocy, sources, tmp_path):
+    """I1 : échec sur la deuxième conversion : trace dans l'audit, puis complétée au passage suivant."""
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    grocy.fail_second_conversion_for = 2
+    cache = OffCache(tmp_path / "off.json")  # la contenance Open Food Facts reste connue grâce au cache du passage
+    report = await run_packaging(client(grocy), sources, cache, audit=audit)
+    statuses = {line["produit"]: line["statut"] for line in report["produits"]}
+    assert statuses["Graines de courge"] == "erreur" and len(own(grocy, 2)) == 1
+    events = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert any(e["event"] == "conditionnement_partiel" and e["produit_id"] == 2 for e in events)
+    grocy.fail_second_conversion_for = None
+    await run_packaging(client(grocy), sources, OffCache(tmp_path / "off.json"), audit=audit)
+    assert own(grocy, 2) == [(1, 2, 0.25), (4, 2, 0.25)] and grocy.products[2]["qu_id_purchase"] == 4
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[1, 2, 3]",
+        '{"status": 1, "product": {"quantity": 250}}',
+        '{"status": 1, "product": ' + "[" * 200_000 + "]" * 200_000 + "}",
+        "pas du json",
+    ],
+)
+async def test_hostile_off_answer_never_stops_the_pass(grocy, tmp_path, body):
+    """I2 : réponse Open Food Facts piégée : le passage continue, les autres produits sont traités."""
+    hostile = FoodSources(transport=httpx2.MockTransport(lambda r: httpx2.Response(200, content=body.encode())))
+    report = await run_packaging(client(grocy), hostile, OffCache(None))
+    assert own(grocy, 1) == [(1, 3, 500)]
+    assert {line["produit"] for line in report["produits"]} >= {"Graines de courge", "Morceaux de noix"}
+
+
+async def test_off_lookups_are_capped_per_pass(grocy, sources, off_calls, monkeypatch):
+    """M1 : au-delà du plafond, le produit est reporté au passage suivant, jamais décidé sans Open Food Facts."""
+    import grocy_mcp.packaging_job as job
+
+    monkeypatch.setattr(job, "MAX_LOOKUPS_PER_PASS", 1)
+    report = await run_packaging(client(grocy), sources, OffCache(None))
+    statuses = {line["produit"]: line["statut"] for line in report["produits"]}
+    assert len(off_calls) == 1 and statuses["Morceaux de noix"] == "reporte"

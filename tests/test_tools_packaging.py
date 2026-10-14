@@ -50,7 +50,7 @@ async def test_voir_conditionnements_manquants(pack, fake):
     assert [m for m, _ in fake.paths() if m in ("POST", "PUT")] == []  # lecture seule
 
 
-async def test_definir_conditionnement_par_defaut_unite_de_stock(pack, fake, settings):
+async def test_definir_conditionnement_paquet(pack, fake, settings):
     out = await pack.definir_conditionnement(JOHNNY, "noix", 250, "g", par="Paquet")
     assert out["statut"] == "ok" and "1 Paquet = 250 Gramme" in out["message"]
     assert [(c["product_id"], c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions] == [(7, 6, 2, 250)]
@@ -94,3 +94,30 @@ async def test_definir_conditionnement_refus(pack, fake, args, error):
 async def test_definir_conditionnement_produit_ambigu(pack, fake):
     out = await pack.definir_conditionnement(JOHNNY, "yaourt", 125, "g")
     assert out["statut"] == "ambigu" and fake.conversions == []
+
+
+async def test_definir_conditionnement_par_defaut_unite_de_stock(pack, fake):
+    fake.products[8] = {"id": 8, "name": "Riz noir", "location_id": 2, "qu_id_stock": 1, "qu_id_purchase": 1, "active": 1}
+    await pack.definir_conditionnement(JOHNNY, "riz noir", 500, "g")
+    assert [(c["from_qu_id"], c["to_qu_id"], c["factor"]) for c in fake.conversions] == [(1, 2, 500)]
+
+
+async def test_definir_conditionnement_refuse_deux_unites_metriques(pack, fake):
+    """I3 de la revue : « 1 Gramme = 250 Gramme » ou « 1 kg = 250 g » propre au produit fausserait le stock."""
+    fake.quantity_units.append({"id": 7, "name": "Kilogramme", "name_plural": "Kilogrammes"})
+    fake.products[7]["qu_id_stock"] = 7
+    with pytest.raises(ToolFailure, match="poids ou volume"):
+        await pack.definir_conditionnement(JOHNNY, "noix", 250, "g")
+    assert fake.conversions == []
+
+
+async def test_definir_conditionnement_refuse_une_contradiction(pack, fake):
+    """I4 : sens inverse ou même dimension déjà réglée pour cette unité."""
+    fake.products[8] = {"id": 8, "name": "Riz noir", "location_id": 2, "qu_id_stock": 1, "qu_id_purchase": 1, "active": 1}
+    fake.conversions.append({"id": 1, "product_id": 8, "from_qu_id": 1, "to_qu_id": 2, "factor": 500})
+    fake.quantity_units.append({"id": 7, "name": "Kilogramme", "name_plural": "Kilogrammes"})
+    with pytest.raises(ToolFailure, match="existe déjà"):
+        await pack.definir_conditionnement(JOHNNY, "riz noir", 1, "kg")
+    with pytest.raises(ToolFailure, match="existe déjà"):
+        await pack.definir_conditionnement(JOHNNY, "riz noir", 0.002, "Pièce", par="g")
+    assert len(fake.conversions) == 1

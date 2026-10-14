@@ -68,6 +68,7 @@ class FakeGrocy:
         self.product_groups: list[dict] = []
         self.conversions: list[dict] = []  # quantity_unit_conversions (product_id None : conversion générale)
         self.fail_conversion_for: int | None = None  # produit dont la création de conversion échoue
+        self.fail_second_conversion_for: int | None = None  # produit dont la 2e conversion échoue (écriture partielle)
         # Champs personnalisés des produits (créés en production par grocy_nutrition_fields.py)
         self.userfield_names = {
             "nutri_kcal_100g", "nutri_proteines_100g", "nutri_glucides_100g", "nutri_sucres_100g", "nutri_lipides_100g",
@@ -231,6 +232,8 @@ class FakeGrocy:
                 return None, _err(400, "FOREIGN KEY constraint failed")
             if pid is not None and (int(pid) not in self.products or int(pid) == self.fail_conversion_for):
                 return None, _err(400, "product_id does not reference an existing product")
+            if pid is not None and int(pid) == self.fail_second_conversion_for and any(c.get("product_id") == pid for c in self.conversions):
+                return None, _err(400, "simulated failure")
             if any(c.get("product_id") == pid and c["from_qu_id"] == data["from_qu_id"] and c["to_qu_id"] == data["to_qu_id"] for c in self.conversions):
                 return None, _err(400, "UNIQUE constraint failed: quantity_unit_conversions")
             new_id = next(self._ids)

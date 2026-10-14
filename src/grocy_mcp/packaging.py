@@ -33,9 +33,27 @@ _WRITTEN = {
 }
 _UNIT = r"(milligrammes?|kilogrammes?|grammes?|millilitres?|centilitres?|litres?|kg|mg|gr|g|ml|cl|dl|l)"
 _NUM = r"(\d+(?:[.,]\d+)?)"
-_END = r"(?![^\W\d_])"  # l'unité n'est pas le début d'un mot (« 3 lots »)
-_PACK = re.compile(rf"(?<![\d.,])(\d{{1,3}})\s*[x×*]\s*{_NUM}\s*{_UNIT}{_END}", re.I)
-_SINGLE = re.compile(rf"(?<![\d.,]){_NUM}\s*{_UNIT}{_END}", re.I)
+_END = r"(?![^\W_])"  # ni lettre ni chiffre après l'unité : « 3 lots », « 1L5 » (1,5 L) ne sont pas lus
+_BEFORE = r"(?<![\d.,/])"  # « 1/2 L » n'est pas lu « 2 L »
+_PACK = re.compile(rf"{_BEFORE}(\d{{1,3}})\s*[x×*]\s*{_NUM}\s*{_UNIT}{_END}", re.I)  # « 6 x 27,5 cl »
+_PACK_AFTER = re.compile(rf"{_BEFORE}{_NUM}\s*{_UNIT}\s*[x×*]\s*(\d{{1,3}})(?![\d.,]?\d)", re.I)  # « 33cl x 6 »
+_SINGLE = re.compile(rf"{_BEFORE}{_NUM}\s*{_UNIT}{_END}", re.I)
+# Un nombre d'éléments dans le nom (« lot de 24 », « 4 pots », « 10 tr. », « x 6 ») : la contenance lue peut être
+# celle d'un élément ou du paquet entier ; rien n'est deviné (revue C2)
+_COUNT = re.compile(
+    r"(?<!\w)(?:(?:lot|pack|coffret|carton|paquet|bo[iî]te)\s+de\s+\d+"
+    r"(?![\d.,]*\s*(?:milligrammes?|kilogrammes?|grammes?|millilitres?|centilitres?|litres?|kg|mg|gr|g|ml|cl|dl|l)(?![^\W_]))"
+    r"|\d{1,3}\s*(?:pots?|bouteilles?|canettes?|capsules?|dosettes?|sachets?|sachets-fraicheur|barres?|tranches?|tr\b\.?"
+    r"|bo[iî]tes?|briques?|portions?|rouleaux?|pi[eè]ces?|oeufs?|œufs?|tablettes?|b[aâ]tonnets?|unit[eé]s?|parts?"
+    r"|biscuits?|gaufres?|crêpes?|yaourts?|x)(?!\w)"
+    r"|[x×]\s*\d{1,3}(?!\d)|(?<!\w)[x×](?!\w))",
+    re.I,
+)
+# Unités de stock qui désignent l'emballage entier : seules elles reçoivent « 1 <unité> = contenance » (revue I5)
+PACKAGE_UNITS = frozenset({
+    "piece", "paquet", "pack", "boite", "bouteille", "canette", "pot", "sachet", "brique", "bocal", "barquette",
+    "flacon", "tube", "sac", "bidon", "berlingot", "seau", "etui", "coffret", "plaquette",
+})
 TOLERANCE = 0.01
 PACKET_NAMES = ("Paquet", "Pièce")  # unités d'achat d'un produit vendu au poids ou au volume
 
@@ -94,7 +112,11 @@ def parse_content(text: str | None) -> Content | _Ambiguous | None:
         count, amount = int(m.group(1)), _number(m.group(2))
         if count >= 2 and amount > 0:
             packs.append(Content(count, amount, _WRITTEN[m.group(3).lower()]))
-    rest = _PACK.sub(" ", text)
+    for m in _PACK_AFTER.finditer(_PACK.sub(" ", text)):
+        amount, count = _number(m.group(1)), int(m.group(3))
+        if count >= 2 and amount > 0:
+            packs.append(Content(count, amount, _WRITTEN[m.group(2).lower()]))
+    rest = _PACK_AFTER.sub(" ", _PACK.sub(" ", text))
     singles = [Content(1, _number(m.group(1)), _WRITTEN[m.group(2).lower()]) for m in _SINGLE.finditer(rest)]
     singles = [s for s in singles if s.amount > 0]
     if packs:
@@ -108,6 +130,8 @@ def parse_content(text: str | None) -> Content | _Ambiguous | None:
         return pack
     if not singles:
         return None
+    if _COUNT.search(rest):
+        return AMBIGUOUS
     first = singles[0]
     if any(not _same(s.per_item(), first.per_item()) for s in singles[1:]):
         return AMBIGUOUS
@@ -148,9 +172,31 @@ def own_conversions(product_id: int, conversions: list[dict]) -> list[dict]:
 def plan_product(
     product: dict, units: dict[int, str], conversions: list[dict], candidates: list[tuple[str, object]]
 ) -> Decision:
-    """Conversions à créer pour un produit ; rien dès qu'un doute existe (spec conditionnement C3 à C5)."""
-    if own_conversions(int(product["id"]), conversions):
+    """Conversions à créer pour un produit ; rien dès qu'un doute existe (spec conditionnement C3 à C5).
+
+    Un produit qui a déjà ses propres conversions n'est complété que si elles font toutes partie de ce que le passage
+    aurait écrit (écriture interrompue, revue I1) ; sinon (réglage manuel) il n'est jamais touché (C4).
+    """
+    own = own_conversions(int(product["id"]), conversions)
+    fresh = _plan(product, units, candidates)
+    if not own:
+        return fresh
+    if fresh.status != "a_ecrire":
         return Decision("deja")
+    planned = {(a, b): f for a, b, f in fresh.conversions}
+    for row in own:
+        key = (int(row["from_qu_id"]), int(row["to_qu_id"]))
+        factor = planned.get(key)
+        if factor is None or abs(float(row["factor"]) - factor) > TOLERANCE * max(factor, 1e-9):
+            return Decision("deja")
+    done = {(int(r["from_qu_id"]), int(r["to_qu_id"])) for r in own}
+    remaining = [c for c in fresh.conversions if (c[0], c[1]) not in done]
+    if not remaining and fresh.purchase_unit is None:
+        return Decision("deja")
+    return Decision("a_ecrire", remaining, fresh.purchase_unit, fresh.source, fresh.content)
+
+
+def _plan(product: dict, units: dict[int, str], candidates: list[tuple[str, object]]) -> Decision:
     found = [(source, content) for source, content in candidates if content is not None]
     if not found:
         return Decision("inconnu")
@@ -167,6 +213,8 @@ def plan_product(
     stock_id = int(product["qu_id_stock"])
     stock_kind = metric_kind(units.get(stock_id, ""))
     if stock_kind is None:
+        if fold(units.get(stock_id, "")) not in PACKAGE_UNITS:
+            return Decision("unite_stock", source=source, content=first)
         target = _unit_id(units, first.unit)
         if target is None:
             return Decision("unite_absente", source=source, content=first)

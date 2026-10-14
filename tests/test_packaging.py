@@ -16,13 +16,18 @@ UNITS = {
         ("KITKAT barre chocolatée 41,5g", Content(1, 41.5, "Gramme")),
         ("La Blanche (Brasserie du Mont Blanc) 75 cl", Content(1, 75, "Centilitre")),
         ("NESCAFÉ® KitKat Latte, Café soluble, Boîte de 273g", Content(1, 273, "Gramme")),
-        ("Viande des grisons (Marque Repère) 80 g (10 tr.)", Content(1, 80, "Gramme")),
         ("Jus de pomme 1,5 L", Content(1, 1.5, "Litre")),
         ("Farine 1 kg", Content(1, 1, "Kilogramme")),
         ("Sel 500 grammes", Content(1, 500, "Gramme")),
         ("Fellowes screen Cleaning Spray - 250 ml", Content(1, 250, "Millilitre")),
         ("Tourtel 6X27,5CL TOURTEL TW CITRON 0.0 DEGRE ALCOOL 1650 ml", Content(6, 27.5, "Centilitre")),
         ("Yaourts 4 x 125 g", Content(4, 125, "Gramme")),
+        ("Coca-Cola 33cl x 6", Content(6, 33, "Centilitre")),
+        ("Bière 25 cl x 12", Content(12, 25, "Centilitre")),
+        ("Nutella B-ready 22g x 6", Content(6, 22, "Gramme")),
+        ("Jus d'orange 100% pur jus 1 L", Content(1, 1, "Litre")),
+        ("Crème 0% 20 cl", Content(1, 20, "Centilitre")),
+        ("Noix paquet de 250 g", Content(1, 250, "Gramme")),
         ("Pâtes 500 g 0,5 kg", Content(1, 500, "Gramme")),  # deux écritures de la même contenance
     ],
 )
@@ -37,6 +42,8 @@ def test_parse_content(text, expected):
         "BiC Velleda Whiteboard Marker Assorted Colours",
         "Bière 0.0 degré",
         "Lot de 4",
+        "Evian 1L5",  # notation 1,5 L : jamais lue « 1 L »
+        "Lait 1/2 L",  # jamais lu « 2 L »
         "",
         None,
     ],
@@ -51,6 +58,16 @@ def test_parse_content_absent(text):
         "Pâtes 500 g 1 kg",  # Review Focus 1 : deux contenances discordantes
         "Tourtel 6X27,5CL 1500 ml",  # lot dont le total ne correspond pas
         "Lait 1 L 500 g",  # masse et volume mêlés
+        # C2 de la revue : un nombre d'éléments dans le nom rend la contenance incertaine
+        "Viande des grisons (Marque Repère) 80 g (10 tr.)",
+        "Eau 50 cl lot de 24",
+        "Yaourts 4 pots de 125 g",
+        "Lot de 4 yaourts 125 g",
+        "Café 10 capsules 5,2 g",
+        "Thon 3 boîtes x 80 g",
+        "6 Oeufs frais 360 g",
+        "Pack de 6 bouteilles 1,5 L",
+        "Bière blonde 25 cl x",
     ],
 )
 def test_parse_content_ambiguous(text):
@@ -128,6 +145,23 @@ def test_plan_missing_packet_unit_still_writes_piece():
     units = {k: v for k, v in UNITS.items() if v != "Paquet"}
     decision = plan_product(product(name="Graines 250 g", stock=1), units, [], [("nom", Content(1, 250, "Gramme"))])
     assert decision.conversions == [(2, 1, 0.25)] and decision.purchase_unit is None
+
+
+def test_plan_completes_its_own_partial_write():
+    """I1 : une écriture interrompue (Paquet créé, Pièce non) est complétée au passage suivant."""
+    partial = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}]
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))])
+    assert decision.status == "a_ecrire" and decision.conversions == [(2, 1, 0.25)] and decision.purchase_unit == 8
+    done = partial + [{"product_id": 1, "from_qu_id": 2, "to_qu_id": 1, "factor": 0.25}]
+    finished = plan_product(product(name="Graines 250 g", stock=1, purchase=8), UNITS, done, [("nom", Content(1, 250, "Gramme"))])
+    assert finished.status == "deja"
+
+
+def test_plan_stock_unit_that_is_not_a_package():
+    """I5 : un produit stocké à la tranche ne reçoit jamais « 1 Tranche = contenance du paquet »."""
+    units = {**UNITS, 10: "Tranche"}
+    decision = plan_product(product(stock=10), units, [], [("nom", Content(1, 80, "Gramme"))])
+    assert decision.status == "unite_stock" and decision.conversions == []
 
 
 def test_plan_ignores_other_products_conversions():

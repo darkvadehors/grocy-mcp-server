@@ -9,11 +9,16 @@ from collections.abc import Callable
 from pathlib import Path
 
 from grocy_mcp.audit import AuditLog
-from grocy_mcp.grocy import GrocyClient, GrocyRequestError
-from grocy_mcp.packaging import AMBIGUOUS, Content, Decision, clean_name, own_conversions, parse_content, plan_product
+from grocy_mcp.grocy import GrocyClient, GrocyError, GrocyRequestError
+from grocy_mcp.packaging import (
+    AMBIGUOUS, Content, Decision, clean_name, metric_kind, own_conversions, parse_content, plan_product,
+)
 from grocy_mcp.sources import FoodSources, SourceError
 
 OFF_TTL = 7 * 86400  # C7 : Open Food Facts interrogé au plus une fois par code-barres et par 7 jours
+MAX_LOOKUPS_PER_PASS = 30  # au-delà, les produits sont reportés au passage suivant (revue M1)
+# Réponse d'Open Food Facts illisible ou piégée : traitée comme une panne, jamais fatale au passage (revue I2)
+_OFF_FAILURES = (SourceError, ValueError, TypeError, OverflowError, RecursionError, AttributeError, KeyError)
 NUTRI_WEIGHT = "nutri_poids_unite_g"
 
 
@@ -58,7 +63,7 @@ async def _off_quantity(sources: FoodSources, cache: OffCache, code: str) -> str
         return quantity
     try:
         quantity = await sources.off_quantity(code)
-    except SourceError:
+    except _OFF_FAILURES:
         return None  # Review Focus 4 : réessayé au prochain passage
     cache.put(code, quantity)
     return quantity
@@ -80,17 +85,30 @@ def describe(content: object) -> str | None:
     return f"{content.count} × {amount} {content.unit}" if content.count > 1 else f"{amount} {content.unit}"
 
 
+def needs_lookup(product: dict, conversions: list[dict], codes: list[str], cache: OffCache) -> bool:
+    """Vrai si décider de ce produit demande un appel réseau à Open Food Facts."""
+    return bool(codes) and not own_conversions(int(product["id"]), conversions) and not cache.get(codes[0])[0]
+
+
 async def decide(product: dict, units: dict[int, str], conversions: list[dict], codes: list[str],
                  sources: FoodSources | None, cache: OffCache) -> Decision:
-    """Décision pour un produit : nom, puis Open Food Facts, puis poids de la partie nutrition (repli)."""
-    if own_conversions(int(product["id"]), conversions):
-        return Decision("deja")  # C4 : sans même interroger Open Food Facts
+    """Décision pour un produit : nom, puis Open Food Facts, puis poids de la partie nutrition (repli).
+
+    Un produit qui a déjà ses propres conversions n'interroge pas Open Food Facts : seul le cache sert, pour compléter
+    une écriture interrompue (revue I1).
+    """
     candidates: list[tuple[str, object]] = [("nom", parse_content(product.get("name")))]
-    if sources is not None and codes:
-        quantity = await _off_quantity(sources, cache, codes[0])
+    if codes:
+        if own_conversions(int(product["id"]), conversions) or sources is None:
+            known, quantity = cache.get(codes[0])
+            quantity = quantity if known else None
+        else:
+            quantity = await _off_quantity(sources, cache, codes[0])
         if quantity:
             candidates.append(("Open Food Facts", parse_content(quantity)))
-    if all(content is None for _, content in candidates):
+    stock_is_metric = metric_kind(units.get(int(product["qu_id_stock"]), "")) is not None
+    # le poids nutrition d'un produit stocké en g ou en kg est celui de l'unité (1 g, 1000 g), pas du paquet (revue C1)
+    if all(content is None for _, content in candidates) and not stock_is_metric:
         weight = _nutrition_weight(product)
         if weight is not None:
             candidates.append(("nutrition", Content(1, weight, "Gramme")))
@@ -119,22 +137,34 @@ async def run_packaging(
     """Écrit les conversions certaines ; ne touche ni au stock, ni aux noms, ni aux conversions existantes (C6)."""
     products, units, conversions, codes = await load_catalog(client)
     account = (await client.current_user()).id if audit is not None and not dry_run else None
-    lines, written = [], 0
+    lines, written, lookups = [], 0, 0
     for product in products:
         pid, name = int(product["id"]), clean_name(product.get("name"))
-        decision = await decide(product, units, conversions, codes.get(pid, []), sources, cache)
+        codes_of = codes.get(pid, [])
+        if sources is not None and needs_lookup(product, conversions, codes_of, cache):
+            if lookups >= MAX_LOOKUPS_PER_PASS:
+                lines.append({"produit": name, "statut": "reporte", "source": None, "contenance": None})
+                continue
+            lookups += 1
+        decision = await decide(product, units, conversions, codes_of, sources, cache)
         status = decision.status
         if status == "a_ecrire" and not dry_run:
+            created: list[list] = []
             try:
                 for source_unit, target_unit, factor in decision.conversions:
                     await client.create_object(
                         "quantity_unit_conversions",
                         {"product_id": pid, "from_qu_id": source_unit, "to_qu_id": target_unit, "factor": factor},
                     )
+                    created.append([source_unit, target_unit, factor])
                 if decision.purchase_unit is not None:
                     await client.set_purchase_unit(pid, decision.purchase_unit)
-            except GrocyRequestError:
-                status = "erreur"  # les autres produits continuent ; les erreurs de clé ou de réseau arrêtent tout
+            except GrocyError as error:
+                if created and audit is not None:  # écriture interrompue : tracée, complétée au prochain passage
+                    audit.write("conditionnement_partiel", compte_id=account, produit_id=pid, conversions=created)
+                if not isinstance(error, GrocyRequestError):
+                    raise  # clé refusée ou Grocy injoignable : tout le passage s'arrête
+                status = "erreur"  # les autres produits continuent
             else:
                 status, written = "ecrit", written + 1
                 if audit is not None:
@@ -147,4 +177,4 @@ async def run_packaging(
     return {"ecrits": written, "produits": lines}
 
 
-__all__ = ["AMBIGUOUS", "OffCache", "decide", "describe", "load_catalog", "run_packaging"]
+__all__ = ["AMBIGUOUS", "OffCache", "decide", "describe", "load_catalog", "needs_lookup", "run_packaging"]

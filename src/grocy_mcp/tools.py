@@ -28,8 +28,8 @@ from grocy_mcp.grocy import (
     GrocyUnavailable,
 )
 from grocy_mcp.nutrition import CiqualIndex, check_values, daily_needs
-from grocy_mcp.packaging import own_conversions, resolve_unit
-from grocy_mcp.packaging_job import OffCache, decide, describe, load_catalog
+from grocy_mcp.packaging import metric_kind, own_conversions, resolve_unit
+from grocy_mcp.packaging_job import OffCache, decide, describe, load_catalog, needs_lookup
 from grocy_mcp.sources import FoodSources, SourceError
 from grocy_mcp.store import Store, sha256_hex
 
@@ -1520,6 +1520,8 @@ class ToolService:
         "incompatible": "contenance en volume pour un produit au poids (ou l'inverse) : précisez avec definir_conditionnement",
         "inconnu": "contenance introuvable : précisez avec definir_conditionnement (ex. 1 Paquet = 250 g)",
         "unite_absente": "unité de contenance absente de Grocy : créez-la, ou précisez avec definir_conditionnement",
+        "unite_stock": "l'unité de stock n'est pas un emballage (tranche, portion…) : précisez avec definir_conditionnement",
+        "reporte": "Open Food Facts pas encore consulté : examiné au prochain passage automatique",
     }
     MAX_PACKAGING_LOOKUPS = 20  # appels à Open Food Facts par appel de l'outil (délai de réponse borné)
 
@@ -1532,11 +1534,12 @@ class ToolService:
             for product in products:
                 pid = int(product["id"])
                 own = codes.get(pid, [])
-                if own and not self._off_cache.get(own[0])[0]:  # code pas encore lu : un appel à Open Food Facts
-                    if lookups >= self.MAX_PACKAGING_LOOKUPS:
-                        own = []
-                    else:
-                        lookups += 1
+                if needs_lookup(product, conversions, own, self._off_cache):
+                    if lookups >= self.MAX_PACKAGING_LOOKUPS:  # jamais décidé sans Open Food Facts (revue M2)
+                        lines.append({"produit": clean_text(product["name"]), "id": pid, "statut": "reporte",
+                                      "explication": self._PACKAGING_HELP["reporte"]})
+                        continue
+                    lookups += 1
                 decision = await decide(product, units, conversions, own, self.sources, self._off_cache)
                 if decision.status == "deja":
                     continue
@@ -1588,17 +1591,29 @@ class ToolService:
             assert target is not None and source is not None
             if target == source:
                 raise ToolFailure("Les deux unités doivent être différentes (ex. 1 Paquet = 250 g).")
+            source_kind, target_kind = metric_kind(units[source]), metric_kind(units[target])
+            if source_kind and target_kind:  # « 1 kg = 250 g » propre au produit fausserait le stock (revue I3)
+                raise ToolFailure(
+                    "Les deux unités sont des unités de poids ou volume : la conversion existe déjà dans Grocy. "
+                    "Indiquez l'emballage dans « par » (ex. par=\"Paquet\", quantite=250, unite=\"g\")."
+                )
             pid, name = int(product["id"]), clean_text(product["name"])
             label = f"1 {clean_text(units[source])} = {float(quantite):g} {clean_text(units[target])}"
-            same = [c for c in own_conversions(pid, await client.quantity_unit_conversions() or [])
-                    if int(c["from_qu_id"]) == source and int(c["to_qu_id"]) == target]
-            if same:
-                if abs(float(same[0]["factor"]) - float(quantite)) <= 1e-9 * max(1.0, float(quantite)):
+            mine = own_conversions(pid, await client.quantity_unit_conversions() or [])
+            for row in mine:
+                a, b, factor = int(row["from_qu_id"]), int(row["to_qu_id"]), float(row["factor"])
+                if (a, b) == (source, target) and abs(factor - float(quantite)) <= 1e-9 * max(1.0, float(quantite)):
                     return {"statut": "existe_deja", "produit": name, "message": f"{name} : {label} existe déjà, rien n'a changé."}
-                raise ToolFailure(
-                    f"Une conversion {clean_text(units[source])} → {clean_text(units[target])} existe déjà pour {name} "
-                    f"(facteur {float(same[0]['factor']):g}) : corrigez-la dans Grocy (fiche du produit)."
-                )
+                # même paire (dans un sens ou l'autre) ou même dimension déjà réglée pour cette unité (revue I4)
+                for here, other in ((a, b), (b, a)):
+                    other_kind = metric_kind(units.get(other, ""))
+                    clash = (here == source and (other == target or (target_kind and other_kind and other_kind[0] == target_kind[0]))) or (
+                        here == target and (other == source or (source_kind and other_kind and other_kind[0] == source_kind[0])))
+                    if clash:
+                        raise ToolFailure(
+                            f"Une conversion existe déjà pour {name} : 1 {clean_text(units.get(a, '?'))} = {factor:g} "
+                            f"{clean_text(units.get(b, '?'))}. Corrigez-la dans Grocy (fiche du produit, conversions d'unités)."
+                        )
             await client.create_object(
                 "quantity_unit_conversions", {"product_id": pid, "from_qu_id": source, "to_qu_id": target, "factor": float(quantite)}
             )
