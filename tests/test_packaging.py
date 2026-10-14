@@ -28,6 +28,10 @@ UNITS = {
         ("Jus d'orange 100% pur jus 1 L", Content(1, 1, "Litre")),
         ("Crème 0% 20 cl", Content(1, 20, "Centilitre")),
         ("Noix paquet de 250 g", Content(1, 250, "Gramme")),
+        ("Coca-Cola 1,25 L", Content(1, 1.25, "Litre")),
+        ("Haribo Tagada 120g", Content(1, 120, "Gramme")),
+        ("Président beurre doux 250 g", Content(1, 250, "Gramme")),
+        ("1,5L CITRON VOLVIC 1,5 l", Content(1, 1.5, "Litre")),
         ("Pâtes 500 g 0,5 kg", Content(1, 500, "Gramme")),  # deux écritures de la même contenance
     ],
 )
@@ -44,6 +48,11 @@ def test_parse_content(text, expected):
         "Lot de 4",
         "Evian 1L5",  # notation 1,5 L : jamais lue « 1 L »
         "Lait 1/2 L",  # jamais lu « 2 L »
+        # seconde revue N2 : plages et milliers séparés par une espace
+        "Pampers Baby-Dry taille 4 9-14 kg",
+        "Poulet 1,2-1,5 kg",
+        "Lessive 1 500 ml",
+        "Barilla Spaghetti n°5 500 g",
         "",
         None,
     ],
@@ -68,6 +77,15 @@ def test_parse_content_absent(text):
         "6 Oeufs frais 360 g",
         "Pack de 6 bouteilles 1,5 L",
         "Bière blonde 25 cl x",
+        # seconde revue N1 : tout nombre suivi d'un mot qui n'est pas une unité rend la contenance incertaine
+        "Pom'Potes 12 gourdes 90 g",
+        "Danette 4 crèmes 125 g",
+        "Gervais 6 petits suisses 60 g",
+        "Vitamine C 500 mg 30 comprimés",
+        "Doliprane 1000 mg 8 comprimés",
+        "Crepes 10 crepes 300 g",
+        "Shampooing 2 en 1 L'Oréal 250 ml",
+        "Poulet fermier 1,2 à 1,5 kg",
     ],
 )
 def test_parse_content_ambiguous(text):
@@ -150,17 +168,31 @@ def test_plan_missing_packet_unit_still_writes_piece():
 def test_plan_completes_its_own_partial_write():
     """I1 : une écriture interrompue (Paquet créé, Pièce non) est complétée au passage suivant."""
     partial = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}]
-    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))])
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))], ours=True)
     assert decision.status == "a_ecrire" and decision.conversions == [(2, 1, 0.25)] and decision.purchase_unit == 8
     done = partial + [{"product_id": 1, "from_qu_id": 2, "to_qu_id": 1, "factor": 0.25}]
-    finished = plan_product(product(name="Graines 250 g", stock=1, purchase=8), UNITS, done, [("nom", Content(1, 250, "Gramme"))])
+    finished = plan_product(product(name="Graines 250 g", stock=1, purchase=8), UNITS, done, [("nom", Content(1, 250, "Gramme"))], ours=True)
     assert finished.status == "deja"
+
+
+def test_plan_never_completes_a_manual_setting():
+    """Seconde revue N3 (a) : « 1 Paquet = 250 g » posé à la main n'est ni complété ni suivi d'un changement d'achat."""
+    manual = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}]
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, manual, [("nom", Content(1, 250, "Gramme"))])
+    assert decision.status == "deja"
+
+
+def test_plan_never_rewrites_a_purchase_unit_changed_by_hand():
+    """Seconde revue N3 (b) : conversions complètes, unité d'achat remise sur kg à la main : rien n'est réécrit."""
+    done = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}, {"product_id": 1, "from_qu_id": 2, "to_qu_id": 1, "factor": 0.25}]
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, done, [("nom", Content(1, 250, "Gramme"))], ours=True)
+    assert decision.status == "deja" and decision.purchase_unit is None
 
 
 def test_plan_completes_despite_grocy_inverse_rows():
     """Grocy ajoute l'inverse de chaque conversion : elle compte comme écrite par le passage."""
     partial = [{"product_id": 1, "from_qu_id": 8, "to_qu_id": 1, "factor": 0.25}, {"product_id": 1, "from_qu_id": 1, "to_qu_id": 8, "factor": 4}]
-    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))])
+    decision = plan_product(product(name="Graines 250 g", stock=1), UNITS, partial, [("nom", Content(1, 250, "Gramme"))], ours=True)
     assert decision.status == "a_ecrire" and decision.conversions == [(2, 1, 0.25)]
 
 

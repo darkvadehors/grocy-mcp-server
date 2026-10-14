@@ -162,13 +162,13 @@ async def test_partial_write_is_audited_and_completed(grocy, sources, tmp_path):
     audit = AuditLog(tmp_path / "audit.jsonl")
     grocy.fail_second_conversion_for = 2
     cache = OffCache(tmp_path / "off.json")  # la contenance Open Food Facts reste connue grâce au cache du passage
-    report = await run_packaging(client(grocy), sources, cache, audit=audit)
+    report = await run_packaging(client(grocy), sources, cache, audit=audit, state=JobState(tmp_path / "traites.json"))
     statuses = {line["produit"]: line["statut"] for line in report["produits"]}
     assert statuses["Graines de courge"] == "erreur" and len(own(grocy, 2)) == 1
     events = [json.loads(line) for line in (tmp_path / "audit.jsonl").read_text().splitlines()]
     assert any(e["event"] == "conditionnement_partiel" and e["produit_id"] == 2 for e in events)
     grocy.fail_second_conversion_for = None
-    await run_packaging(client(grocy), sources, OffCache(tmp_path / "off.json"), audit=audit)
+    await run_packaging(client(grocy), sources, OffCache(tmp_path / "off.json"), audit=audit, state=JobState(tmp_path / "traites.json"))
     assert own(grocy, 2) == [(1, 2, 0.25), (4, 2, 0.25)] and grocy.products[2]["qu_id_purchase"] == 4
 
 

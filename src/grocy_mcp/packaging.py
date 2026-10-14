@@ -34,7 +34,8 @@ _WRITTEN = {
 _UNIT = r"(milligrammes?|kilogrammes?|grammes?|millilitres?|centilitres?|litres?|kg|mg|gr|g|ml|cl|dl|l)"
 _NUM = r"(\d+(?:[.,]\d+)?)"
 _END = r"(?![^\W_])"  # ni lettre ni chiffre après l'unité : « 3 lots », « 1L5 » (1,5 L) ne sont pas lus
-_BEFORE = r"(?<![\d.,/])"  # « 1/2 L » n'est pas lu « 2 L »
+# ni « 1/2 L » lu « 2 L », ni une plage « 9-14 kg », ni un millier « 1 500 ml » ou « n°5 500 g » lus à moitié
+_BEFORE = r"(?<![\d.,/\-])(?<!\d\s)"
 _PACK = re.compile(rf"{_BEFORE}(\d{{1,3}})\s*[x×*]\s*{_NUM}\s*{_UNIT}{_END}", re.I)  # « 6 x 27,5 cl »
 _PACK_AFTER = re.compile(rf"{_BEFORE}{_NUM}\s*{_UNIT}\s*[x×*]\s*(\d{{1,3}})(?![\d.,]?\d)", re.I)  # « 33cl x 6 »
 _SINGLE = re.compile(rf"{_BEFORE}{_NUM}\s*{_UNIT}{_END}", re.I)
@@ -49,6 +50,9 @@ _COUNT = re.compile(
     r"|[x×]\s*\d{1,3}(?!\d)|(?<!\w)[x×](?!\w))",
     re.I,
 )
+# Nombre suivi d'un mot qui n'est pas une unité (« 12 gourdes », « 30 comprimés », « 2 en 1 », « 1,2 à 1,5 kg ») :
+# liste ouverte, rien n'est deviné (seconde revue N1)
+_NUMBER_WORD = re.compile(r"(?<![\w.,])\d+(?:[.,]\d+)?\s*[^\W\d_]")
 # Unités de stock qui désignent l'emballage entier : seules elles reçoivent « 1 <unité> = contenance » (revue I5)
 PACKAGE_UNITS = frozenset({
     "piece", "paquet", "pack", "boite", "bouteille", "canette", "pot", "sachet", "brique", "bocal", "barquette",
@@ -130,7 +134,7 @@ def parse_content(text: str | None) -> Content | _Ambiguous | None:
         return pack
     if not singles:
         return None
-    if _COUNT.search(rest):
+    if _COUNT.search(rest) or _NUMBER_WORD.search(_SINGLE.sub(" ", rest)):
         return AMBIGUOUS
     first = singles[0]
     if any(not _same(s.per_item(), first.per_item()) for s in singles[1:]):
@@ -170,18 +174,19 @@ def own_conversions(product_id: int, conversions: list[dict]) -> list[dict]:
 
 
 def plan_product(
-    product: dict, units: dict[int, str], conversions: list[dict], candidates: list[tuple[str, object]]
+    product: dict, units: dict[int, str], conversions: list[dict], candidates: list[tuple[str, object]], ours: bool = False
 ) -> Decision:
     """Conversions à créer pour un produit ; rien dès qu'un doute existe (spec conditionnement C3 à C5).
 
-    Un produit qui a déjà ses propres conversions n'est complété que si elles font toutes partie de ce que le passage
-    aurait écrit (écriture interrompue, revue I1) ; sinon (réglage manuel) il n'est jamais touché (C4).
+    Un produit qui a déjà ses propres conversions n'est complété que si le passage l'a lui-même commencé (ours :
+    écriture interrompue, revue I1) et qu'elles font toutes partie de ce qu'il aurait écrit ; un réglage manuel n'est
+    jamais touché (C4, seconde revue N3).
     """
     own = own_conversions(int(product["id"]), conversions)
     fresh = _plan(product, units, candidates)
     if not own:
         return fresh
-    if fresh.status != "a_ecrire":
+    if not ours or fresh.status != "a_ecrire":
         return Decision("deja")
     planned = {(a, b): f for a, b, f in fresh.conversions}
     planned.update({(b, a): 1 / f for a, b, f in fresh.conversions})  # Grocy ajoute lui-même l'inverse de chaque conversion
@@ -193,7 +198,7 @@ def plan_product(
     done = {(int(r["from_qu_id"]), int(r["to_qu_id"])) for r in own}
     done |= {(b, a) for a, b in done}
     remaining = [c for c in fresh.conversions if (c[0], c[1]) not in done]
-    if not remaining and fresh.purchase_unit is None:
+    if not remaining:  # l'unité d'achat n'est posée qu'avec les conversions : jamais réécrite si changée à la main
         return Decision("deja")
     return Decision("a_ecrire", remaining, fresh.purchase_unit, fresh.source, fresh.content)
 

@@ -125,7 +125,7 @@ def needs_lookup(product: dict, conversions: list[dict], codes: list[str], cache
 
 
 async def decide(product: dict, units: dict[int, str], conversions: list[dict], codes: list[str],
-                 sources: FoodSources | None, cache: OffCache) -> Decision:
+                 sources: FoodSources | None, cache: OffCache, ours: bool = False) -> Decision:
     """Décision pour un produit : nom, puis Open Food Facts, puis poids de la partie nutrition (repli).
 
     Un produit qui a déjà ses propres conversions n'interroge pas Open Food Facts : seul le cache sert, pour compléter
@@ -146,7 +146,7 @@ async def decide(product: dict, units: dict[int, str], conversions: list[dict], 
         weight = _nutrition_weight(product)
         if weight is not None:
             candidates.append(("nutrition", Content(1, weight, "Gramme")))
-    return plan_product(product, units, conversions, candidates)
+    return plan_product(product, units, conversions, candidates, ours=ours)
 
 
 async def load_catalog(client: GrocyClient) -> tuple[list[dict], dict[int, str], list[dict], dict[int, list[str]]]:
@@ -185,7 +185,7 @@ async def run_packaging(
                 lines.append({"produit": name, "statut": "reporte", "source": None, "contenance": None})
                 continue
             lookups += 1
-        decision = await decide(product, units, conversions, codes_of, sources, cache)
+        decision = await decide(product, units, conversions, codes_of, sources, cache, ours=state is not None and pid in state.done)
         status = decision.status
         if status == "a_ecrire" and not dry_run:
             created: list[list] = []

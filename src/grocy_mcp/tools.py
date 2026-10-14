@@ -1547,7 +1547,7 @@ class ToolService:
                                       "explication": self._PACKAGING_HELP["reporte"]})
                         continue
                     lookups += 1
-                decision = await decide(product, units, conversions, own, self.sources, self._off_cache)
+                decision = await decide(product, units, conversions, own, self.sources, self._off_cache, ours=pid in done)
                 if decision.status == "deja":
                     continue
                 lines.append({
