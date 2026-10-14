@@ -44,6 +44,8 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 | `rechercher_ciqual` | Search the Ciqual table with simple words, to pick a code for `definir_nutrition` | read |
 | `definir_nutrition` | Set a product's nutrition facts (Ciqual code or values), unit weight, or mark it non-food | action |
 | `autonomie_alimentaire` | How many days the household can live on the current stock (energy, proteins), computed by the server | read |
+| `voir_conditionnements_manquants` | Products whose packaging (1 piece = 250 g, 1 pack = 6 bottles) is not set yet, and why | read |
+| `definir_conditionnement` | Sets a product's packaging: 1 `par` = `quantite` `unite` (creates a product-specific unit conversion, never replaces one) | write |
 | `annuler_derniere_action` | Undo the last action made through this server | action |
 
 Tool names and messages are in French.
@@ -97,7 +99,20 @@ Master key:
 ```bash
 python -m grocy_mcp generate-key /etc/grocy-mcp/mcp-key          # 32 random bytes, file 0600
 python -m grocy_mcp rotate-key /etc/grocy-mcp/mcp-key /etc/grocy-mcp/mcp-key.new
+python -m grocy_mcp conditionner [--dry-run]                       # packaging pass (see below)
 ```
+
+### Automatic packaging
+
+`python -m grocy_mcp conditionner`, run by a timer (for instance every 10 minutes), gives every product its packaging
+so that the right units appear when stock is added: « 1 piece = 500 g » for a counted product, « 1 packet = 1 piece =
+250 g » (and purchase in packets) for a product stocked by weight or volume. The content is read from the product
+name, then from the Open Food Facts « quantity » of its barcode (at most once per barcode every 7 days), then from the
+unit weight of the nutrition fields. Nothing is written when sources disagree, for multipacks (« 6 x 27.5 cl ») or
+when a product already has its own conversion; the stock, quantities and names are never changed. Use a dedicated Grocy
+account with the single permission `MASTER_DATA_EDIT`; its API key is read from `$CREDENTIALS_DIRECTORY/auto-key`
+(or `MCP_AUTO_KEY_FILE`), the Open Food Facts cache from `$STATE_DIRECTORY/off-cache.json` (or `MCP_PACKAGING_STATE`)
+and its own audit log goes to `$LOGS_DIRECTORY/conditionnement.jsonl` (or `MCP_PACKAGING_AUDIT`).
 
 ## Typical deployment
 

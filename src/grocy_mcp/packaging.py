@@ -128,6 +128,19 @@ def _unit_id(units: dict[int, str], name: str) -> int | None:
     return next((uid for uid, label in units.items() if fold(label) == wanted), None)
 
 
+def resolve_unit(units: dict[int, str], text: str | None, plurals: dict[int, str] | None = None) -> int | None:
+    """Unité Grocy désignée par son nom, son pluriel ou une abréviation (« g », « cL », « bouteilles »)."""
+    wanted = fold(text or "")
+    if not wanted:
+        return None
+    if wanted in _WRITTEN:
+        return _unit_id(units, _WRITTEN[wanted])
+    found = _unit_id(units, wanted)
+    if found is None and plurals:
+        found = next((uid for uid, label in plurals.items() if label and fold(label) == wanted and uid in units), None)
+    return found
+
+
 def own_conversions(product_id: int, conversions: list[dict]) -> list[dict]:
     return [c for c in conversions if c.get("product_id") not in (None, "") and int(c["product_id"]) == int(product_id)]
 

@@ -21,7 +21,8 @@ TOOLS = {
     "rechercher_produit", "voir_stock", "voir_peremptions", "voir_produit", "voir_liste_courses",
     "recettes_faisables", "voir_references", "ajouter_liste_courses", "retirer_liste_courses",
     "ajouter_manquants_liste", "enregistrer_achat", "consommer", "ouvrir", "deplacer",
-    "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie", "voir_nutrition", "completer_nutrition", "definir_nutrition", "autonomie_alimentaire", "rechercher_ciqual"}
+    "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie", "voir_nutrition", "completer_nutrition", "definir_nutrition", "autonomie_alimentaire", "rechercher_ciqual",
+    "voir_conditionnements_manquants", "definir_conditionnement"}
 SECRETS: list[str] = []
 
 
@@ -252,7 +253,7 @@ async def test_import_de_bout_en_bout(http, fake):
     _, tokens, _, _ = await login(http)
     access = tokens["access_token"]
     listing = (await rpc(http, access, "tools/list")).json()["result"]["tools"]
-    assert len(listing) == 24
+    assert len(listing) == 26
     importer = next(t for t in listing if t["name"] == "importer_articles")
     assert "FoodShiner" in importer["description"] and importer["annotations"]["destructiveHint"] is False
     fake.lookup_db["5449000000996"] = {"name": "Coca-Cola 33 cl"}
@@ -271,6 +272,8 @@ async def test_nutrition_de_bout_en_bout(http, fake):
     listing = {t["name"]: t for t in (await rpc(http, access, "tools/list")).json()["result"]["tools"]}
     assert listing["autonomie_alimentaire"]["annotations"]["readOnlyHint"] is True
     assert listing["definir_nutrition"]["annotations"]["destructiveHint"] is True
+    assert listing["voir_conditionnements_manquants"]["annotations"]["readOnlyHint"] is True
+    assert listing["definir_conditionnement"]["annotations"]["destructiveHint"] is False
     error, out = await tool(http, access, "voir_nutrition", produit="lait")
     assert not error and out["statut"] == "sans_donnees"
     error, out = await tool(http, access, "definir_nutrition", produit="pâtes", ciqual=9104, poids_unite_g=500)

@@ -44,6 +44,8 @@ Construit sur le SDK Python officiel de MCP (`mcp==2.3.0`) : le même processus 
 | `rechercher_ciqual` | Chercher un aliment dans la table Ciqual avec des mots simples, pour choisir un code pour `definir_nutrition` | lecture |
 | `definir_nutrition` | Fixer les apports d'un produit (code Ciqual ou valeurs), le poids d'une unité, ou le marquer non alimentaire | action |
 | `autonomie_alimentaire` | Nombre de jours que le foyer peut tenir avec le stock actuel (énergie, protéines), calculé par le serveur | lecture |
+| `voir_conditionnements_manquants` | Produits dont le conditionnement (1 pièce = 250 g, 1 pack = 6 bouteilles) n'est pas encore réglé, et pourquoi | lecture |
+| `definir_conditionnement` | Règle le conditionnement d'un produit : 1 `par` = `quantite` `unite` (crée une conversion propre au produit, n'en remplace jamais) | écriture |
 | `annuler_derniere_action` | Annuler la dernière action faite par ce serveur | action |
 
 ## Apports nutritionnels
@@ -95,7 +97,21 @@ Clé maître :
 ```bash
 python -m grocy_mcp generate-key /etc/grocy-mcp/mcp-key          # 32 octets aléatoires, fichier 0600
 python -m grocy_mcp rotate-key /etc/grocy-mcp/mcp-key /etc/grocy-mcp/mcp-key.new
+python -m grocy_mcp conditionner [--dry-run]                       # passage de conditionnement (voir ci-dessous)
 ```
+
+### Conditionnement automatique
+
+`python -m grocy_mcp conditionner`, lancé par un timer (par exemple toutes les 10 minutes), donne à chaque produit son
+conditionnement pour que les bonnes unités apparaissent à la saisie : « 1 pièce = 500 g » pour un produit compté,
+« 1 paquet = 1 pièce = 250 g » (et achat au paquet) pour un produit stocké au poids ou au volume. La contenance est lue
+dans le nom du produit, puis dans la « quantité » Open Food Facts de son code-barres (au plus une fois par code tous
+les 7 jours), puis dans le poids unitaire des champs nutrition. Rien n'est écrit si les sources divergent, pour un lot
+(« 6 x 27,5 cl ») ou si le produit a déjà sa propre conversion ; le stock, les quantités et les noms ne sont jamais
+modifiés. Utilisez un compte Grocy dédié avec la seule permission `MASTER_DATA_EDIT` ; sa clé API est lue dans
+`$CREDENTIALS_DIRECTORY/auto-key` (ou `MCP_AUTO_KEY_FILE`), le cache Open Food Facts dans
+`$STATE_DIRECTORY/off-cache.json` (ou `MCP_PACKAGING_STATE`), et son journal d'audit propre va dans
+`$LOGS_DIRECTORY/conditionnement.jsonl` (ou `MCP_PACKAGING_AUDIT`).
 
 ## Déploiement type
 

@@ -28,6 +28,8 @@ from grocy_mcp.grocy import (
     GrocyUnavailable,
 )
 from grocy_mcp.nutrition import CiqualIndex, check_values, daily_needs
+from grocy_mcp.packaging import own_conversions, resolve_unit
+from grocy_mcp.packaging_job import OffCache, decide, describe, load_catalog
 from grocy_mcp.sources import FoodSources, SourceError
 from grocy_mcp.store import Store, sha256_hex
 
@@ -163,6 +165,7 @@ class ToolService:
         self.grocy_factory = grocy_factory
         self.sources = sources or FoodSources(usda_key=_read_key(settings.usda_key_path))
         self._ciqual = ciqual
+        self._off_cache = OffCache(None)  # contenances Open Food Facts déjà lues (mémoire du processus)
 
     @property
     def ciqual(self) -> CiqualIndex:
@@ -1507,6 +1510,103 @@ class ToolService:
             return {"statut": "ok", "produit": name, "message": f"Apports de {name} mis à jour."}
 
         return await self._action(caller, "definir_nutrition", args, cle_idempotence, run)
+
+    # --- conditionnement (spec conditionnement C8) -----------------------------------------------------
+    _PACKAGING_HELP = {
+        "a_ecrire": "contenance certaine : réglé automatiquement au prochain passage (toutes les 10 minutes)",
+        "lot": "lot de plusieurs éléments : précisez avec definir_conditionnement (ex. 1 Pack = 6 Bouteille, "
+        "puis 1 Bouteille = 27,5 cL)",
+        "contradictoire": "contenances discordantes (nom, Open Food Facts) : précisez avec definir_conditionnement",
+        "incompatible": "contenance en volume pour un produit au poids (ou l'inverse) : précisez avec definir_conditionnement",
+        "inconnu": "contenance introuvable : précisez avec definir_conditionnement (ex. 1 Paquet = 250 g)",
+        "unite_absente": "unité de contenance absente de Grocy : créez-la, ou précisez avec definir_conditionnement",
+    }
+    MAX_PACKAGING_LOOKUPS = 20  # appels à Open Food Facts par appel de l'outil (délai de réponse borné)
+
+    async def voir_conditionnements_manquants(self, caller: Caller) -> dict:
+        """Produits sans conversion propre, avec ce que fera le passage automatique ou ce qu'il faut préciser."""
+
+        async def run(client: GrocyClient) -> dict:
+            products, units, conversions, codes = await load_catalog(client)
+            lines, lookups = [], 0
+            for product in products:
+                pid = int(product["id"])
+                own = codes.get(pid, [])
+                if own and not self._off_cache.get(own[0])[0]:  # code pas encore lu : un appel à Open Food Facts
+                    if lookups >= self.MAX_PACKAGING_LOOKUPS:
+                        own = []
+                    else:
+                        lookups += 1
+                decision = await decide(product, units, conversions, own, self.sources, self._off_cache)
+                if decision.status == "deja":
+                    continue
+                lines.append({
+                    "produit": clean_text(product["name"]),
+                    "id": pid,
+                    "unite_stock": clean_text(units.get(int(product["qu_id_stock"]), "")),
+                    "statut": decision.status,
+                    "contenance": describe(decision.content),
+                    "source": decision.source,
+                    "explication": self._PACKAGING_HELP[decision.status],
+                })
+            return {
+                "produits": lines[:MAX_RESULTS * 10],
+                "message": f"{len(lines)} produit(s) sans conditionnement." if lines else "Tous les produits ont un conditionnement.",
+            }
+
+        return await self._grocy(caller, run)
+
+    async def definir_conditionnement(
+        self,
+        caller: Caller,
+        produit: str,
+        quantite: float,
+        unite: str,
+        par: str | None = None,
+        cle_idempotence: str | None = None,
+    ) -> dict:
+        if not _is_number(quantite) or not 0 < quantite <= 1_000_000:  # type: ignore[operator]
+            raise ToolFailure("quantite doit être un nombre strictement positif, au plus 1 000 000.")
+        if not isinstance(unite, str) or not unite.strip() or (par is not None and not isinstance(par, str)):
+            raise ToolFailure("Indiquez l'unité de contenance (ex. « g », « cL », « Bouteille »).")
+        args = {"produit": clean_text(produit), "quantite": quantite, "unite": clean_text(unite, 40),
+                "par": clean_text(par, 40) if par else None}
+
+        async def run(client: GrocyClient) -> dict:
+            status, product = await self._find_product(client, produit)
+            if status != "ok":
+                return self._unresolved(status, product, produit)
+            rows = await client.quantity_units()
+            units = {int(u["id"]): str(u["name"]) for u in rows}
+            plurals = {int(u["id"]): str(u.get("name_plural") or "") for u in rows}
+            target = resolve_unit(units, unite, plurals)
+            source = resolve_unit(units, par, plurals) if par else int(product["qu_id_stock"])
+            for wanted, found in ((unite, target), (par, source)):
+                if found is None:
+                    names = ", ".join(clean_text(n) for n in units.values())
+                    raise ToolFailure(f"Unité « {clean_text(wanted, 40)} » inconnue de Grocy. Unités : {names}.")
+            assert target is not None and source is not None
+            if target == source:
+                raise ToolFailure("Les deux unités doivent être différentes (ex. 1 Paquet = 250 g).")
+            pid, name = int(product["id"]), clean_text(product["name"])
+            label = f"1 {clean_text(units[source])} = {float(quantite):g} {clean_text(units[target])}"
+            same = [c for c in own_conversions(pid, await client.quantity_unit_conversions() or [])
+                    if int(c["from_qu_id"]) == source and int(c["to_qu_id"]) == target]
+            if same:
+                if abs(float(same[0]["factor"]) - float(quantite)) <= 1e-9 * max(1.0, float(quantite)):
+                    return {"statut": "existe_deja", "produit": name, "message": f"{name} : {label} existe déjà, rien n'a changé."}
+                raise ToolFailure(
+                    f"Une conversion {clean_text(units[source])} → {clean_text(units[target])} existe déjà pour {name} "
+                    f"(facteur {float(same[0]['factor']):g}) : corrigez-la dans Grocy (fiche du produit)."
+                )
+            await client.create_object(
+                "quantity_unit_conversions", {"product_id": pid, "from_qu_id": source, "to_qu_id": target, "factor": float(quantite)}
+            )
+            self.audit.write("conditionnement", compte_id=caller.grocy_user_id, produit_id=pid, source="manuel",
+                             conversions=[[source, target, float(quantite)]])
+            return {"statut": "ok", "produit": name, "message": f"Conditionnement de {name} : {label}."}
+
+        return await self._action(caller, "definir_conditionnement", args, cle_idempotence, run)
 
     async def rechercher_ciqual(self, caller: Caller, texte: str) -> dict:
         """Recherche libre dans la table Ciqual (aucun appel à Grocy) : pour choisir le code de definir_nutrition."""
