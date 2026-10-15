@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -15,16 +16,18 @@ from zoneinfo import ZoneInfo
 from grocy_mcp.grocy import GrocyClient, GrocyForbidden, GrocyRequestError, GrocyUnavailable
 from grocy_mcp.prices import (
     apply_discounts,
+    best_split,
     check_total,
     fold,
     latest_by_store,
     match_store,
     normalized_price,
+    price_rises,
     stock_amount,
     suggest_products,
 )
 from grocy_mcp.sources import SourceError
-from grocy_mcp.tools import Caller, ToolFailure, ToolService, _product_ref, clean_text
+from grocy_mcp.tools import Caller, ToolFailure, ToolService, _num, _product_ref, clean_text
 
 MAX_LINE_PRICE = 1000
 OLD_DAYS = 90
@@ -38,6 +41,9 @@ LABEL = 80
 TOTAL_TOLERANCE = 0.05
 SCAN_BEFORE, SCAN_AFTER = 3, 1  # entrée scannée sans prix : de 3 jours avant le ticket à 1 jour après
 ACTIONS = ("ajouter", "completer", "prix_seulement", "ignorer")
+SPLIT_MAX_AGE = 180  # jours : au-delà, un prix n'entre pas dans la répartition
+SPLIT_MAX_ITEMS = 60
+_MONTH = re.compile(r"(20[0-9]{2})-(0[1-9]|1[0-2])")
 
 
 def _is_amount(value: object) -> bool:
@@ -427,6 +433,129 @@ class PricesService(ToolService):
     def _remember_tx(state: dict, rows: list[dict] | None) -> None:
         if rows and rows[0].get("transaction_id") and str(rows[0]["transaction_id"]) not in state["transactions"]:
             state["transactions"].append(str(rows[0]["transaction_id"]))
+
+    # --- repartir_courses (P4) ------------------------------------------------------------------------
+    async def repartir_courses(self, caller: Caller, max_magasins: int = 2) -> dict:
+        if not isinstance(max_magasins, int) or isinstance(max_magasins, bool) or not 1 <= max_magasins <= 3:
+            raise ToolFailure("max_magasins doit être 1, 2 ou 3.")
+
+        async def run(client: GrocyClient) -> dict:
+            listed = [i for i in await client.shopping_list() if not int(i.get("done") or 0)]
+            notes = [clean_text(i.get("note"), 60) for i in listed if i.get("product_id") is None and i.get("note")]
+            names = {int(p["id"]): clean_text(p["name"]) for p in await client.products()}
+            shops = {int(s["id"]): s for s in await client.shopping_locations()}
+            since = (self._today() - timedelta(days=SPLIT_MAX_AGE)).isoformat()
+            wanted: dict[int, float] = {}
+            for item in listed:
+                if item.get("product_id") is not None:
+                    pid = int(item["product_id"])
+                    wanted[pid] = wanted.get(pid, 0) + float(item.get("amount") or 1)
+            items: dict[str, dict[int, float]] = {}
+            for pid in list(wanted)[:SPLIT_MAX_ITEMS]:
+                recent = [r for r in await self._known_prices(client, pid) if r["date"] >= since]
+                items[str(pid)] = {loc: row["prix"] * wanted[pid] for loc, row in latest_by_store(recent).items()}
+            split = best_split(items, max_magasins)
+            by_store: dict[int, list[dict]] = {}
+            for key, loc in split["affectation"].items():
+                by_store.setdefault(loc, []).append(
+                    {"produit": names.get(int(key), f"#{key}"), "quantite": _num(wanted[int(key)]), "prix_estime": round(items[key][loc], 2)}
+                )
+            stores = [
+                {"magasin": _store_name(shops.get(loc)) or f"magasin {loc}", "articles": rows,
+                 "sous_total": round(sum(r["prix_estime"] for r in rows), 2)}
+                for loc, rows in sorted(by_store.items())
+            ]
+            reference = split["reference"]
+            return {
+                "statut": "ok",
+                "max_magasins": max_magasins,
+                "par_magasin": stores,
+                "total": split["total"],
+                "economie": {"par_rapport_a": _store_name(shops.get(reference["magasin"])),
+                             "montant": round(reference["total"] - split["total"], 2)} if reference else None,
+                "sans_prix": [names.get(int(key), f"#{key}") for key in split["non_couverts"]],
+                "sans_produit": notes,
+                "message": f"Estimation d'après les derniers prix connus (moins de {SPLIT_MAX_AGE} jours) ; l'économie est "
+                "calculée sur les mêmes articles que le meilleur magasin seul.",
+            }
+
+        return await self._grocy(caller, run)
+
+    # --- depenses (P5) -------------------------------------------------------------------------------
+    def _months(self, mois: object, derniers_mois: object) -> list[str]:
+        if mois is not None:
+            if not isinstance(mois, str) or not _MONTH.fullmatch(mois):
+                raise ToolFailure("mois doit être au format AAAA-MM.")
+            return [mois]
+        if not isinstance(derniers_mois, int) or isinstance(derniers_mois, bool) or not 1 <= derniers_mois <= 12:
+            raise ToolFailure("derniers_mois doit être un entier de 1 à 12.")
+        today = self._today()
+        months = []
+        for back in range(derniers_mois - 1, -1, -1):
+            index = today.year * 12 + today.month - 1 - back
+            months.append(f"{index // 12:04d}-{index % 12 + 1:02d}")
+        return months
+
+    @staticmethod
+    def _purchases(log: list[dict]) -> list[dict]:
+        """Achats non annulés avec leur prix (celui de la dernière modification s'il a été complété ensuite)."""
+        live = [r for r in log if not int(r.get("undone") or 0)]
+        edits: dict[str, dict] = {}
+        for row in live:
+            if row.get("transaction_type") == "stock-edit-new":
+                stock = str(row.get("stock_id"))
+                if stock not in edits or int(row["id"]) > int(edits[stock]["id"]):
+                    edits[stock] = row
+        found = []
+        for row in live:
+            if row.get("transaction_type") != "purchase":
+                continue
+            latest = edits.get(str(row.get("stock_id")), row)
+            price = _to_float(latest.get("price"))
+            amount = _to_float(row.get("amount"))
+            if not price or price <= 0 or not amount or amount <= 0:
+                continue
+            found.append({"product_id": int(row["product_id"]), "location_id": latest.get("shopping_location_id"),
+                          "date": str(latest.get("purchased_date") or row.get("purchased_date") or "")[:10],
+                          "prix": price, "montant": amount * price})
+        return found
+
+    async def depenses(self, caller: Caller, mois: str | None = None, derniers_mois: int = 3) -> dict:
+        months = self._months(mois, derniers_mois)
+
+        async def run(client: GrocyClient) -> dict:
+            purchases = self._purchases(await client.stock_log())
+            shops = {int(s["id"]): s for s in await client.shopping_locations()}
+            names = {int(p["id"]): clean_text(p["name"]) for p in await client.products()}
+
+            def shop(loc: object) -> str:
+                return _store_name(shops.get(int(loc))) if loc is not None else "magasin non indiqué"
+
+            report = []
+            for month in months:
+                totals: dict[str, float] = {}
+                for p in purchases:
+                    if p["date"][:7] == month:
+                        totals[shop(p["location_id"])] = totals.get(shop(p["location_id"]), 0) + p["montant"]
+                report.append({"mois": month, "total": round(sum(totals.values()), 2),
+                               "par_magasin": [{"magasin": k, "total": round(v, 2)} for k, v in sorted(totals.items(), key=lambda kv: -kv[1])]})
+            rows = [p for p in purchases if p["location_id"] is not None] + self.store.prices_for(None)
+            rises = [
+                {"produit": names.get(r["product_id"], f"#{r['product_id']}"), "magasin": shop(r["location_id"]),
+                 "avant": r["avant"], "apres": r["apres"], "hausse_pct": r["hausse_pct"], "date": r["date"]}
+                for r in price_rises(rows)
+                if str(r["date"])[:7] in months
+            ]
+            return {
+                "statut": "ok",
+                "par_mois": report,
+                "total": round(sum(m["total"] for m in report), 2),
+                "hausses": rises,
+                "message": "Dépenses d'après les achats enregistrés dans Grocy avec un prix ; hausses de plus de 10 % "
+                "entre deux prix d'un même produit dans un même magasin.",
+            }
+
+        return await self._grocy(caller, run)
 
     async def _france_reference(self, client: GrocyClient, produit: str, product_id: int) -> dict | None:
         text = clean_text(produit)

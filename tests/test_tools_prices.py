@@ -337,3 +337,80 @@ async def test_ticket_memory_ignores_a_reused_product_number(prices, fake, store
     fake.products[5] = {**fake.products[5], "name": "Papier toilette", "row_created_timestamp": "2026-10-15 08:00:00"}
     again = await preview(prices, date="2026-10-15", total=1.0, lignes=[{"libelle": "PATES PENNE", "prix": 1.0}])
     assert again["lignes"][0]["origine"] != "memoire" and again["lignes"][0]["produit"] is None
+
+
+# --- repartir_courses (P4) et depenses (P5) -------------------------------------------------------
+def grocy(fake):
+    return GrocyClient("https://grocy.example.test", KEY_JOHNNY_IA, transport=fake.transport())
+
+
+@pytest.fixture
+def basket(fake):
+    fake.shopping = [
+        {"id": 1, "product_id": 5, "amount": 2.0, "note": None, "shopping_list_id": 1, "done": 0},
+        {"id": 2, "product_id": 4, "amount": 1.0, "note": None, "shopping_list_id": 1, "done": 0},
+        {"id": 3, "product_id": 1, "amount": 1.0, "note": None, "shopping_list_id": 1, "done": 0},
+        {"id": 4, "product_id": None, "amount": 1.0, "note": "piles", "shopping_list_id": 1, "done": 0},
+        {"id": 5, "product_id": 2, "amount": 1.0, "note": None, "shopping_list_id": 1, "done": 1},  # déjà acheté
+    ]
+    return fake
+
+
+async def test_repartir_courses(prices, basket, store):
+    c = grocy(basket)
+    await c.purchase(5, 1, price=1.0, purchased_date="2026-10-01", shopping_location_id=2)
+    await c.purchase(4, 1, price=2.0, purchased_date="2026-10-01", shopping_location_id=2)
+    store.add_price(4, product_id=5, location_id=3, price=0.8, day="2026-10-10", source="rayon")
+    store.add_price(4, product_id=2, location_id=3, price=0.1, day="2026-10-10", source="rayon")  # article coché
+    one = await prices.repartir_courses(JOHNNY, max_magasins=1)
+    assert [m["magasin"] for m in one["par_magasin"]] == ["Leclerc"] and one["total"] == 4.0  # 2 × 1,0 + 2,0
+    assert one["sans_prix"] == ["Lait demi-écrémé"] and one["sans_produit"] == ["piles"] and one["economie"] is None
+    two = await prices.repartir_courses(JOHNNY)
+    stores = {m["magasin"]: m for m in two["par_magasin"]}
+    assert stores["Intermarché"]["articles"] == [{"produit": "Pâtes", "quantite": 2, "prix_estime": 1.6}]
+    assert stores["Leclerc"]["sous_total"] == 2.0 and two["total"] == 3.6
+    assert two["economie"] == {"par_rapport_a": "Leclerc", "montant": 0.4}
+
+
+async def test_repartir_courses_ignores_old_prices_and_bad_input(prices, basket):
+    await grocy(basket).purchase(5, 1, price=1.0, purchased_date="2026-03-01", shopping_location_id=2)  # > 180 jours
+    result = await prices.repartir_courses(JOHNNY)
+    assert result["par_magasin"] == [] and "Pâtes" in result["sans_prix"]
+    for bad in (0, 4, True, "2"):
+        with pytest.raises(ToolFailure, match="max_magasins"):
+            await prices.repartir_courses(JOHNNY, max_magasins=bad)
+
+
+async def test_depenses_by_month_and_store_with_rises(prices, fake, store):
+    c = grocy(fake)
+    await c.purchase(5, 2, price=1.5, purchased_date="2026-09-10", shopping_location_id=2)
+    await c.purchase(4, 1, price=2.0, purchased_date="2026-10-05", shopping_location_id=3)
+    undone = await c.purchase(4, 5, price=9.0, purchased_date="2026-10-06", shopping_location_id=3)
+    await c.undo(undone[0]["transaction_id"])
+    store.add_price(3, product_id=5, location_id=2, price=1.8, day="2026-10-12", source="rayon")  # +20 %
+    october = await prices.depenses(JOHNNY, mois="2026-10")
+    assert october["total"] == 2.0 and october["par_mois"] == [
+        {"mois": "2026-10", "total": 2.0, "par_magasin": [{"magasin": "Intermarché", "total": 2.0}]}]
+    both = await prices.depenses(JOHNNY, derniers_mois=2)
+    assert both["total"] == 5.0 and [m["mois"] for m in both["par_mois"]] == ["2026-09", "2026-10"]
+    assert both["hausses"] == [{"produit": "Pâtes", "magasin": "Leclerc", "avant": 1.5, "apres": 1.8, "hausse_pct": 20.0,
+                                "date": "2026-10-12"}]
+
+
+async def test_depenses_uses_completed_price(prices, fake):
+    entry = fake.add_entry(5, 2, fake_date(30), 2)
+    entry["purchased_date"] = "2026-10-13"
+    await grocy(fake).edit_stock_entry(entry["id"], {"amount": 2, "open": 0, "purchased_date": "2026-10-13", "price": 1.25,
+                                                     "shopping_location_id": 2, "location_id": 2})
+    fake.log.append({"id": 1, "transaction_id": "tx-scan", "product_id": 5, "amount": 2, "transaction_type": "purchase",
+                     "stock_id": entry["stock_id"], "undone": 0, "price": None, "purchased_date": "2026-10-13",
+                     "shopping_location_id": None})
+    result = await prices.depenses(JOHNNY, mois="2026-10")
+    assert result["total"] == 2.5
+
+
+@pytest.mark.parametrize(("args", "match"), [({"mois": "2026-13"}, "mois"), ({"mois": "oct"}, "mois"),
+                                              ({"derniers_mois": 0}, "derniers_mois"), ({"derniers_mois": 13}, "derniers_mois")])
+async def test_depenses_bad_input(prices, args, match):
+    with pytest.raises(ToolFailure, match=match):
+        await prices.depenses(JOHNNY, **args)
