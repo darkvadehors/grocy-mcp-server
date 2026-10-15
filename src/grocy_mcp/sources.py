@@ -47,6 +47,14 @@ class SourceError(Exception):
     """Source injoignable ou réponse refusée (redirection, taille, format)."""
 
 
+class TooLarge(SourceError):
+    """Réponse au-delà de la taille permise."""
+
+
+class ImageRejected(SourceError):
+    """Photo refusée pour de bon (adresse, absente, trop lourde, pas une image) ; une panne n'en est pas une."""
+
+
 def _clean(value: object, limit: int = 120) -> str:
     text = "".join(ch for ch in str(value or "") if unicodedata.category(ch)[0] != "C")
     return " ".join(text.split())[:limit]
@@ -149,7 +157,7 @@ class FoodSources:
                     async for chunk in response.aiter_bytes():
                         body += chunk
                         if len(body) > limit:
-                            raise SourceError("réponse trop volumineuse")
+                            raise TooLarge("réponse trop volumineuse")
             except httpx2.HTTPError:
                 raise SourceError("source injoignable") from None
         return body
@@ -214,11 +222,16 @@ class FoodSources:
     async def fetch_image(self, url: str) -> tuple[bytes, str]:
         """Photo d'Open Food Facts : hôte d'images seulement, sans redirection, 1 Mo au plus, JPEG, PNG ou WebP."""
         if not valid_image_url(url):
-            raise SourceError("adresse d'image refusée")
-        data = await self._get_bytes(url, limit=MAX_IMAGE_BYTES, missing_ok=False)
-        kind = image_kind(data or b"")
+            raise ImageRejected("adresse d'image refusée")
+        try:
+            data = await self._get_bytes(url, limit=MAX_IMAGE_BYTES)
+        except TooLarge:
+            raise ImageRejected("image trop volumineuse") from None
+        if data is None:
+            raise ImageRejected("réponse 404 : photo absente")
+        kind = image_kind(data)
         if kind is None:
-            raise SourceError("ce n'est pas une image JPEG, PNG ou WebP")
+            raise ImageRejected("ce n'est pas une image JPEG, PNG ou WebP")
         return data, kind
 
     async def usda(self, code: str) -> dict | None:

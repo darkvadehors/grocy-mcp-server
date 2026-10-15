@@ -17,7 +17,7 @@ from grocy_mcp.grocy import GrocyClient, GrocyError, GrocyRequestError
 from grocy_mcp.packaging import (
     AMBIGUOUS, Content, Decision, clean_name, metric_kind, own_conversions, parse_content, plan_product,
 )
-from grocy_mcp.sources import FoodSources, SourceError
+from grocy_mcp.sources import FoodSources, ImageRejected, SourceError
 
 _NO_RECORD = object()
 OFF_TTL = 7 * 86400  # C7 : Open Food Facts interrogé au plus une fois par code-barres et par 7 jours
@@ -131,7 +131,7 @@ class JobState:
         known = self.created.get(pid)
         return pid in self.done and (known is None or not isinstance(stamp, str) or known == stamp)
 
-    def renew(self, product: dict) -> None:
+    def renew(self, product: dict, save: bool = True) -> None:
         """Oublie la mémoire d'un numéro de produit réutilisé (l'app Grocy Mobile choisit elle-même les numéros)."""
         pid, stamp = int(product["id"]), product.get("row_created_timestamp")
         if not isinstance(stamp, str) or not stamp:
@@ -145,7 +145,8 @@ class JobState:
         elif pid not in self.done and pid not in self.filled:
             return  # rien à retenir pour ce produit
         self.created[pid] = stamp
-        self._save()
+        if save:  # une simulation n'écrit rien, pas même la mémoire (revue M6)
+            self._save()
 
     def mark_field(self, product_id: int, name: str, created: object = None) -> None:
         if isinstance(created, str) and created:
@@ -227,6 +228,21 @@ async def load_catalog(client: GrocyClient) -> tuple[list[dict], dict[int, str],
     return sorted(products, key=lambda p: int(p["id"])), units, conversions, codes
 
 
+class _Budget:
+    """Requêtes réseau d'un passage (fiches et photos) : plafond commun, pause entre deux requêtes."""
+
+    def __init__(self) -> None:
+        self.used = 0
+
+    def full(self) -> bool:
+        return self.used >= MAX_LOOKUPS_PER_PASS
+
+    async def take(self) -> None:
+        if self.used and LOOKUP_PAUSE:
+            await asyncio.sleep(LOOKUP_PAUSE)
+        self.used += 1
+
+
 class _Failed(Exception):
     """Open Food Facts en panne pour ce code pendant ce passage."""
 
@@ -259,7 +275,7 @@ def _num(value: float) -> float | int:
 
 async def _enrich(
     client: GrocyClient, sources: FoodSources | None, cache: OffCache, product: dict, code: str, plan,
-    state: JobState | None, written: list[str],
+    state: JobState | None, written: list[str], budget: _Budget,
 ) -> None:
     """Écrit le plan champ par champ (catégorie, nutrition, photo) ; chaque champ écrit est mémorisé aussitôt."""
     pid = int(product["id"])
@@ -275,18 +291,24 @@ async def _enrich(
     if "nutrition" in plan.fields:
         nutrition = plan.nutrition
         fields: dict[str, object] = {NUTRI_BY_KEY[k]: _num(v) for k, v in nutrition["valeurs"].items() if k in NUTRI_BY_KEY}
-        if not (product.get("userfields") or {}).get(NUTRI_WEIGHT):
-            fields[NUTRI_WEIGHT] = _num(nutrition["poids"])
-        fields["nutri_source"] = f"Open Food Facts {code} (automatique{', ml comptés 1 g' if nutrition['approximatif'] else ''})"
+        # le poids déduit n'est jamais écrit dans nutri_poids_unite_g : le conditionnement le relirait comme une
+        # contenance et recréerait une conversion supprimée par une personne (revue I1) ; il reste dans la source
+        if not (product.get("userfields") or {}).get("nutri_source"):  # une source saisie à la main reste (revue M5)
+            approx = ", ml comptés 1 g" if nutrition["approximatif"] else ""
+            fields["nutri_source"] = (f"Open Food Facts {code} (automatique, {_num(nutrition['poids'])} g par unité"
+                                      f"{approx})")
         await client.set_userfields(pid, fields)
+        done("nutrition")  # apports écrits : mémorisés même si l'énergie échoue ensuite (revue I2)
         await client.set_product_calories(pid, nutrition["calories"])
-        done("nutrition")
-    if "photo" in plan.fields and sources is not None:
+    if "photo" in plan.fields and sources is not None and not budget.full():  # photo comptée dans le plafond (M2)
+        await budget.take()
         try:
             data, ext = await sources.fetch_image(plan.image_url)
-        except _OFF_FAILURES:
-            cache.drop_image(code)  # jamais retéléchargée tant que la fiche est en cache
+        except ImageRejected:
+            cache.drop_image(code)  # refus définitif : jamais retéléchargée tant que la fiche est en cache
             return
+        except _OFF_FAILURES:
+            return  # panne passagère (429, délai…) : nouvel essai au prochain passage (revue M4)
         name = await client.upload_product_picture(_picture_name(pid, code, ext), data)
         await client.set_product_fields(pid, {"picture_file_name": name})
         done("photo")
@@ -310,12 +332,12 @@ async def run_packaging(
     products, units, conversions, codes = await load_catalog(client)
     account = (await client.current_user()).id if audit is not None and not dry_run else None
     groups = (await client.product_groups() or []) if enrich and rules else []
-    lines, written, lookups = [], 0, 0
+    lines, written, budget = [], 0, _Budget()
     for product in products:
         pid, name = int(product["id"]), clean_name(product.get("name"))
         codes_of = codes.get(pid, [])
         if state is not None:
-            state.renew(product)
+            state.renew(product, save=not dry_run)
         filled = state.filled.get(pid, set()) if state is not None else set()
         wants = enrich and bool(codes_of) and bool(missing_fields(product, filled))
         retired = state is not None and pid in state.done and not own_conversions(pid, conversions)
@@ -323,13 +345,13 @@ async def run_packaging(
         if sources is not None and codes_of:
             pack_lookup = not retired and needs_lookup(product, conversions, codes_of, cache)
             enrich_lookup = wants and not cache.record(codes_of[0])[0]
-            if pack_lookup or enrich_lookup:
-                if lookups >= MAX_LOOKUPS_PER_PASS:
+            if (pack_lookup or enrich_lookup) and budget.full():
+                if pack_lookup:
                     lines.append({"produit": name, "statut": "reporte", "source": None, "contenance": None})
                     continue
-                if lookups and LOOKUP_PAUSE:
-                    await asyncio.sleep(LOOKUP_PAUSE)
-                lookups += 1
+                wants = False  # seul l'enrichissement attendait une requête : le conditionnement continue (revue M1)
+            elif pack_lookup or enrich_lookup:
+                await budget.take()
                 if enrich_lookup:
                     try:
                         await _off_record(sources, cache, codes_of[0])
@@ -351,7 +373,7 @@ async def run_packaging(
                     done = list(plan.fields)
                 else:
                     try:
-                        await _enrich(client, sources, cache, product, codes_of[0], plan, state, done)
+                        await _enrich(client, sources, cache, product, codes_of[0], plan, state, done, budget)
                     except GrocyError as error:
                         if audit is not None:
                             audit.write("enrichissement_partiel", compte_id=account, produit_id=pid, champs=done)

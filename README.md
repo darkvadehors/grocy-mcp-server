@@ -121,7 +121,7 @@ is the code or starts with « code »), the nutrition fields and the native ener
 unit is certain: typed by a person, a metric stock unit, or a product conversion to a metric unit), and the product
 picture (front image from `images.openfoodfacts.org` only, no redirect, 1 MB at most, JPEG, PNG or WebP checked by
 signature). A field is never overwritten, and a field filled by the pass then emptied by a person is never filled
-again (`traites.json`). Non-food products (`nutri_non_alimentaire`) never get nutrition.
+again (`traites.json`). The weight used for the energy is written in `nutri_source`, never in `nutri_poids_unite_g`. Products whose `nutri_non_alimentaire` box is ticked never get nutrition: tick it for non-food products that Open Food Facts happens to know. Network requests of a pass (product sheets and pictures) share one cap, with a one-second pause between them.
 
 ## Typical deployment
 

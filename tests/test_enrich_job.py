@@ -92,7 +92,7 @@ async def test_fills_only_empty_fields(grocy, sources, calls, tmp_path):
     rice, water, pen, flour = (grocy.products[i] for i in (1, 2, 3, 4))
     # riz : contenance (nom vide, Open Food Facts « 500 g »), puis catégorie, nutrition au poids du sachet, photo
     assert rice["product_group_id"] == 28 and grocy.userfield_values[1]["nutri_kcal_100g"] == "350"
-    assert grocy.userfield_values[1]["nutri_poids_unite_g"] == "500" and rice["calories"] == 1750
+    assert "nutri_poids_unite_g" not in grocy.userfield_values[1] and rice["calories"] == 1750  # revue I1
     assert "Open Food Facts 3000000000011" in grocy.userfield_values[1]["nutri_source"]
     assert rice["picture_file_name"].startswith("off-1-3000000000011-") and grocy.files[rice["picture_file_name"]] == JPEG
     # eau : catégorie la plus précise ; stockée à la bouteille sans contenance : aucune énergie inventée
@@ -177,8 +177,8 @@ async def test_error_on_one_product_keeps_the_others(grocy, sources, tmp_path):
 async def test_lookups_share_the_budget(grocy, sources, calls, tmp_path, monkeypatch):
     monkeypatch.setattr(packaging_job, "MAX_LOOKUPS_PER_PASS", 2)
     report = await run(grocy, sources, tmp_path)
-    assert len([c for k, c in calls if k == "off"]) == 2
-    assert sum(line["statut"] == "reporte" for line in report["produits"]) == 2
+    assert calls == [("off", RICE), ("image", calls[1][1])]  # fiche du riz puis sa photo : plafond atteint
+    assert sum(line["statut"] == "reporte" for line in report["produits"]) == 3
 
 
 async def test_upload_picture_name_and_content(grocy):
@@ -224,4 +224,72 @@ async def test_pause_between_open_food_facts_requests(grocy, sources, tmp_path, 
     monkeypatch.setattr(packaging_job, "LOOKUP_PAUSE", 1.0)
     monkeypatch.setattr(packaging_job.asyncio, "sleep", fake_sleep)
     await run(grocy, sources, tmp_path)
-    assert pauses == [1.0, 1.0, 1.0]  # 4 codes, 4 requêtes
+    assert pauses == [1.0] * 6  # 4 fiches et 3 photos : 7 requêtes, une pause entre chacune
+
+
+# --- corrections de la revue finale -------------------------------------------------------------------------
+async def test_r_i1_derived_weight_is_not_written(grocy, sources, tmp_path):
+    """I1 : le poids déduit d'une conversion n'est pas écrit dans nutri_poids_unite_g (il recréerait la conversion)."""
+    await run(grocy, sources, tmp_path)
+    assert "nutri_poids_unite_g" not in grocy.userfield_values[1]
+    assert "500 g par unité" in grocy.userfield_values[1]["nutri_source"] and grocy.products[1]["calories"] == 1750
+
+
+async def test_r_i2_userfields_written_then_calories_fail(grocy, sources, tmp_path):
+    """I2 : apports écrits puis énergie refusée : « nutrition » est mémorisé et audité, jamais réécrit."""
+    original = grocy._put_product
+
+    def refuse_calories(user, request, body, product_id):
+        if "calories" in body:
+            return httpx2.Response(400, json={"error_message": "refusé"})
+        return original(user, request, body, product_id)
+
+    grocy._put_product = refuse_calories
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    await run(grocy, sources, tmp_path, audit=audit)
+    assert "nutrition" in JobState(tmp_path / "traites.json").filled[1]
+    events = [json.loads(x) for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    partial = [e for e in events if e["event"] == "enrichissement_partiel" and e["produit_id"] == 1]
+    assert partial and "nutrition" in partial[0]["champs"]
+
+
+async def test_r_m1_budget_never_postpones_a_packaging_without_lookup(grocy, sources, calls, tmp_path, monkeypatch):
+    """M1 : plafond atteint, un produit dont le nom suffit est conditionné quand même."""
+    monkeypatch.setattr(packaging_job, "MAX_LOOKUPS_PER_PASS", 1)
+    grocy.conversions = [{"id": 1, "product_id": 2, "from_qu_id": 7, "to_qu_id": 3, "factor": 500}]  # déjà conditionnée
+    report = await run(grocy, sources, tmp_path)
+    lines = {line["produit"]: line for line in report["produits"]}
+    assert lines["Eau de source"]["statut"] == "deja" and "enrichi" not in lines["Eau de source"]
+
+
+async def test_r_m2_images_count_in_the_budget(grocy, sources, calls, tmp_path, monkeypatch):
+    """M2 : chaque photo téléchargée compte dans le plafond du passage."""
+    monkeypatch.setattr(packaging_job, "MAX_LOOKUPS_PER_PASS", 2)
+    await run(grocy, sources, tmp_path)
+    assert len(calls) <= 2
+
+
+async def test_r_m4_transient_image_failure_is_retried(grocy, sources, calls, images, tmp_path):
+    """M4 : une panne passagère (429) n'écarte pas la photo pour 7 jours."""
+    images[IMG] = httpx2.Response(429)
+    await run(grocy, sources, tmp_path)
+    assert grocy.products[1].get("picture_file_name") is None
+    images.pop(IMG)
+    await run(grocy, sources, tmp_path)
+    assert grocy.products[1]["picture_file_name"]
+
+
+async def test_r_m5_source_typed_by_a_person_is_kept(grocy, sources, tmp_path):
+    grocy.userfield_values[1] = {"nutri_source": "étiquette du sachet"}
+    await run(grocy, sources, tmp_path)
+    assert grocy.userfield_values[1]["nutri_source"] == "étiquette du sachet"
+    assert grocy.userfield_values[1]["nutri_kcal_100g"] == "350"
+
+
+async def test_r_m6_dry_run_writes_no_memory(grocy, sources, tmp_path):
+    path = tmp_path / "traites.json"
+    path.write_text(json.dumps({"traites": [1]}))
+    before = path.read_text()
+    grocy.products[1]["row_created_timestamp"] = "2026-10-15 08:17:12"
+    await run(grocy, sources, tmp_path, dry_run=True, state=JobState(path))
+    assert path.read_text() == before
