@@ -134,3 +134,15 @@ async def test_voir_conditionnements_respecte_les_produits_retires(pack, fake, t
     out = await pack.voir_conditionnements_manquants(JOHNNY)
     line = {line["produit"]: line for line in out["produits"]}["Pâtes 500 g"]
     assert line["statut"] == "retire" and "definir_conditionnement" in line["explication"]
+
+
+async def test_voir_conditionnements_numero_reutilise(pack, fake, tmp_path):
+    """Un numéro de produit réutilisé par l'app n'hérite pas du statut « retire » de l'ancienne fiche."""
+    import dataclasses
+    import json as _json
+
+    (tmp_path / "traites.json").write_text(_json.dumps({"traites": [5], "crees": {"5": "2026-10-01 10:00:00"}}))
+    pack.settings = dataclasses.replace(pack.settings, packaging_done_path=tmp_path / "traites.json")
+    fake.products[5]["row_created_timestamp"] = "2026-10-15 08:17:12"
+    out = await pack.voir_conditionnements_manquants(JOHNNY)
+    assert {line["produit"]: line for line in out["produits"]}["Pâtes 500 g"]["statut"] == "a_ecrire"

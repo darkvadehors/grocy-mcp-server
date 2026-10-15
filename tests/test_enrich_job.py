@@ -190,3 +190,25 @@ async def test_upload_picture_name_and_content(grocy):
         await client(grocy).set_product_fields(1, {"name": "x"})
     encoded = base64.b64encode(b"off-1-3000000000011-1.jpg").decode()
     assert ("PUT", f"/api/files/productpictures/{encoded}") in grocy.calls
+
+
+async def test_reused_product_id_starts_fresh(grocy, sources, tmp_path):
+    """L'app Grocy Mobile réutilise le numéro d'un produit supprimé : la mémoire de l'ancien ne vaut pas pour le nouveau."""
+    grocy.products[1]["row_created_timestamp"] = "2026-10-13 10:00:00"
+    await run(grocy, sources, tmp_path)
+    assert JobState(tmp_path / "traites.json").filled[1] == {"categorie", "nutrition", "photo"}
+    grocy.products[1] = {"id": 1, "name": "Riz noir", "location_id": 1, "qu_id_stock": 1, "qu_id_purchase": 1,
+                         "qu_id_price": 1, "active": 1, "row_created_timestamp": "2026-10-15 08:17:12"}
+    grocy.conversions = [c for c in grocy.conversions if c.get("product_id") != 1]
+    grocy.userfield_values.pop(1, None)
+    await run(grocy, sources, tmp_path)
+    assert grocy.products[1]["product_group_id"] == 28 and grocy.products[1]["picture_file_name"]
+    assert [c["factor"] for c in grocy.conversions if c.get("product_id") == 1][:1] == [500]  # conditionné à nouveau
+
+
+async def test_same_product_keeps_its_memory(grocy, sources, tmp_path):
+    grocy.products[1]["row_created_timestamp"] = "2026-10-13 10:00:00"
+    await run(grocy, sources, tmp_path)
+    grocy.products[1]["product_group_id"] = None
+    await run(grocy, sources, tmp_path)
+    assert grocy.products[1]["product_group_id"] is None

@@ -1532,12 +1532,13 @@ class ToolService:
 
         async def run(client: GrocyClient) -> dict:
             products, units, conversions, codes = await load_catalog(client)
-            done = JobState(self.settings.packaging_done_path).done if self.settings.packaging_done_path else set()
+            state = JobState(self.settings.packaging_done_path) if self.settings.packaging_done_path else None
             lines, lookups = [], 0
             for product in products:
                 pid = int(product["id"])
                 own = codes.get(pid, [])
-                if pid in done and not own_conversions(pid, conversions):
+                handled = state is not None and state.handled(product)
+                if handled and not own_conversions(pid, conversions):
                     lines.append({"produit": clean_text(product["name"]), "id": pid, "statut": "retire",
                                   "explication": self._PACKAGING_HELP["retire"]})
                     continue
@@ -1547,7 +1548,7 @@ class ToolService:
                                       "explication": self._PACKAGING_HELP["reporte"]})
                         continue
                     lookups += 1
-                decision = await decide(product, units, conversions, own, self.sources, self._off_cache, ours=pid in done)
+                decision = await decide(product, units, conversions, own, self.sources, self._off_cache, ours=handled)
                 if decision.status == "deja":
                     continue
                 lines.append({

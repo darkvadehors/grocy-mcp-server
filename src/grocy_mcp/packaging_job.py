@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -87,6 +88,7 @@ class JobState:
         self.path = Path(path) if path else None
         self.done: set[int] = set()
         self.filled: dict[int, set[str]] = {}  # champs remplis par l'enrichissement, jamais remplis à nouveau
+        self.created: dict[int, str] = {}  # date de création de la fiche : un numéro réutilisé repart de zéro
         if self.path and self.path.exists():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -98,6 +100,10 @@ class JobState:
             for key, names in (filled or {}).items() if isinstance(filled, dict) else ():
                 if str(key).isdigit() and isinstance(names, list):
                     self.filled[int(key)] = {n for n in names if n in FIELDS}
+            created = data.get("crees") if isinstance(data, dict) else None
+            for key, stamp in (created or {}).items() if isinstance(created, dict) else ():
+                if str(key).isdigit() and isinstance(stamp, str):
+                    self.created[int(key)] = stamp
 
     def _save(self) -> None:
         if self.path is None:
@@ -106,15 +112,42 @@ class JobState:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"traites": sorted(self.done),
-                       "enrichis": {str(k): sorted(v) for k, v in sorted(self.filled.items()) if v}}, f)
+                       "enrichis": {str(k): sorted(v) for k, v in sorted(self.filled.items()) if v},
+                       "crees": {str(k): v for k, v in sorted(self.created.items())}}, f)
         os.replace(tmp, self.path)
 
-    def mark(self, product_id: int) -> None:
+    def mark(self, product_id: int, created: object = None) -> None:
+        if isinstance(created, str) and created:
+            self.created[int(product_id)] = created
         if int(product_id) not in self.done:
             self.done.add(int(product_id))
             self._save()
 
-    def mark_field(self, product_id: int, name: str) -> None:
+    def handled(self, product: dict) -> bool:
+        """Lecture seule : produit déjà traité, et pas une autre fiche sous un numéro réutilisé."""
+        pid, stamp = int(product["id"]), product.get("row_created_timestamp")
+        known = self.created.get(pid)
+        return pid in self.done and (known is None or not isinstance(stamp, str) or known == stamp)
+
+    def renew(self, product: dict) -> None:
+        """Oublie la mémoire d'un numéro de produit réutilisé (l'app Grocy Mobile choisit elle-même les numéros)."""
+        pid, stamp = int(product["id"]), product.get("row_created_timestamp")
+        if not isinstance(stamp, str) or not stamp:
+            return
+        known = self.created.get(pid)
+        if known == stamp:
+            return
+        if known is not None:  # autre fiche sous le même numéro
+            self.done.discard(pid)
+            self.filled.pop(pid, None)
+        elif pid not in self.done and pid not in self.filled:
+            return  # rien à retenir pour ce produit
+        self.created[pid] = stamp
+        self._save()
+
+    def mark_field(self, product_id: int, name: str, created: object = None) -> None:
+        if isinstance(created, str) and created:
+            self.created[int(product_id)] = created
         self.filled.setdefault(int(product_id), set()).add(name)
         self._save()
 
@@ -210,9 +243,8 @@ async def _off_record(sources: FoodSources, cache: OffCache, code: str) -> dict 
 
 def _picture_name(product_id: int, code: str, ext: str) -> str:
     """Nom unique (Grocy n'écrase jamais un fichier) dont l'écriture en base64 ne contient ni « / » ni « + »."""
-    stamp = int(time.time())
-    for attempt in range(64):
-        name = f"off-{product_id}-{code}-{stamp}{f'-{attempt}' if attempt else ''}.{ext}"
+    for _ in range(64):
+        name = f"off-{product_id}-{code}-{int(time.time())}-{secrets.token_hex(3)}.{ext}"
         if not set(base64.b64encode(name.encode()).decode()) & {"/", "+"}:
             return name
     raise ValueError("nom de photo introuvable")
@@ -233,7 +265,7 @@ async def _enrich(
     def done(name: str) -> None:
         written.append(name)
         if state is not None:
-            state.mark_field(pid, name)
+            state.mark_field(pid, name, product.get("row_created_timestamp"))
 
     if "categorie" in plan.fields:
         await client.set_product_fields(pid, {"product_group_id": plan.group_id})
@@ -280,6 +312,8 @@ async def run_packaging(
     for product in products:
         pid, name = int(product["id"]), clean_name(product.get("name"))
         codes_of = codes.get(pid, [])
+        if state is not None:
+            state.renew(product)
         filled = state.filled.get(pid, set()) if state is not None else set()
         wants = enrich and bool(codes_of) and bool(missing_fields(product, filled))
         retired = state is not None and pid in state.done and not own_conversions(pid, conversions)
@@ -353,7 +387,7 @@ async def _package(
         except GrocyError as error:
             if created:  # écriture interrompue : tracée, complétée au prochain passage
                 if state is not None:
-                    state.mark(pid)
+                    state.mark(pid, product.get("row_created_timestamp"))
                 if audit is not None:
                     audit.write("conditionnement_partiel", compte_id=account, produit_id=pid, conversions=created)
             if not isinstance(error, GrocyRequestError):
@@ -362,7 +396,7 @@ async def _package(
         else:
             status = "ecrit"
             if state is not None:
-                state.mark(pid)
+                state.mark(pid, product.get("row_created_timestamp"))
             if audit is not None:
                 audit.write(
                     "conditionnement", compte_id=account, produit_id=pid, source=decision.source,
