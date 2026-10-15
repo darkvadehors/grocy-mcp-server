@@ -168,3 +168,60 @@ async def test_lot_probable_detecte(name, quantity, serving, lot):
     )
     t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
     assert (await FoodSources(transport=t).off("3017620422003")).get("lot") == lot
+
+
+# --- enrichissement : une seule requête par fiche, photo contrôlée ------------------------------------------
+IMG = "https://images.openfoodfacts.org/images/products/301/762/042/2003/front_fr.12.400.jpg"
+OFF_FULL = {"status": 1, "product": {**OFF_PRODUCT["product"], "quantity": "500 g", "image_front_url": IMG,
+                                     "categories_tags": ["en:plant-based-foods", "en:pastas"]}}
+JPEG = b"\xff\xd8\xff\xe0" + b"0" * 100
+
+
+async def test_off_record_une_requete():
+    seen = []
+    t = transport({"https://world.openfoodfacts.org/api/v2/product/3017620422003.json": httpx2.Response(200, json=OFF_FULL)}, seen)
+    record = await FoodSources(transport=t).off_record("3017620422003")
+    assert record["q"] == "500 g" and record["v"]["kcal"] == 359 and record["img"] == IMG
+    assert record["cats"] == ["en:plant-based-foods", "en:pastas"] and len(seen) == 1
+    assert "image_front_url" in seen[0] and "categories_tags" in seen[0]
+
+
+async def test_off_record_absent_et_fiche_piegee():
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(404, json={"status": 0})})
+    assert await FoodSources(transport=t).off_record("3017620422003") is None
+    hostile = {"status": 1, "product": {"quantity": ["x"], "nutriments": "rien", "image_front_url": 42,
+                                         "image_url": "https://evil.test/a.jpg", "categories_tags": "en:pastas"}}
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=hostile)})
+    record = await FoodSources(transport=t).off_record("3017620422003")
+    assert record == {"q": None, "v": {}, "img": None, "cats": []}
+    with pytest.raises(SourceError):
+        await FoodSources(transport=t).off_record("abc")
+
+
+async def test_off_record_image_de_secours_et_kj():
+    product = {"status": 1, "product": {"image_url": IMG, "nutriments": {"energy-kj_100g": 1500},
+                                         "categories_tags": ["en:a"] * 300}}
+    t = transport({"https://world.openfoodfacts.org/": httpx2.Response(200, json=product)})
+    record = await FoodSources(transport=t).off_record("3017620422003")
+    assert record["img"] == IMG and record["v"] == {"kcal": 359} and len(record["cats"]) == 100
+
+
+async def test_fetch_image():
+    t = transport({IMG: httpx2.Response(200, content=JPEG)})
+    assert await FoodSources(transport=t).fetch_image(IMG) == (JPEG, "jpg")
+
+
+@pytest.mark.parametrize(
+    ("url", "response", "error"),
+    [
+        ("https://evil.test/a.jpg", httpx2.Response(200, content=JPEG), "adresse"),
+        (IMG, httpx2.Response(302, headers={"location": "https://evil.test/a.jpg"}), "réponse"),
+        (IMG, httpx2.Response(200, content=b"<svg onload=alert(1)>"), "image"),
+        (IMG, httpx2.Response(200, content=b"\xff\xd8\xff" + b"0" * 1_000_001), "volumineuse"),
+        (IMG, httpx2.Response(404), "réponse"),
+    ],
+)
+async def test_fetch_image_refus(url, response, error):
+    t = transport({url: response, IMG: response})
+    with pytest.raises(SourceError, match=error):
+        await FoodSources(transport=t).fetch_image(url)

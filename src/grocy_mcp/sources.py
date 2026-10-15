@@ -13,6 +13,7 @@ import unicodedata
 import httpx2
 
 from grocy_mcp import __version__
+from grocy_mcp.enrich import MAX_IMAGE_BYTES, image_kind, valid_image_url
 from grocy_mcp.nutrition import weight_in_grams
 
 _BARCODE = re.compile(r"[0-9]{8,14}")
@@ -20,6 +21,10 @@ _MULTIPACK = re.compile(r"\d\s*[x×*]\s*\d", re.I)
 _NAME_WEIGHT = re.compile(r"\d+(?:[.,]\d+)?\s*(?:kg|gr|g)\b", re.I)
 OFF_URL = "https://world.openfoodfacts.org/api/v2/product/{code}.json"
 USDA_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
+OFF_RECORD_FIELDS = (
+    "quantity,product_quantity,product_quantity_unit,nutriments,image_front_url,image_url,categories_tags"
+)
+MAX_CATEGORIES = 100
 TIMEOUT = 10.0
 MAX_BYTES = 1_000_000
 USER_AGENT = f"grocy-mcp-server/{__version__} (+https://github.com/darkvadehors/grocy-mcp-server)"
@@ -60,6 +65,31 @@ def _number(value: object) -> float | None:
 
 def _compact(value: float) -> float | int:
     return int(value) if value == int(value) else value
+
+
+def _off_values(product: dict) -> dict:
+    """Valeurs pour 100 g d'une fiche Open Food Facts (énergie en kJ convertie)."""
+    nutriments = product.get("nutriments") if isinstance(product.get("nutriments"), dict) else {}
+    values = {}
+    for key, field in _OFF_FIELDS.items():
+        number = _number(nutriments.get(field))
+        if number is not None:
+            values[key] = _compact(number)
+    if "kcal" not in values:  # énergie seulement en kJ sur beaucoup de fiches
+        kj = _number(nutriments.get("energy-kj_100g")) or _number(nutriments.get("energy_100g"))
+        if kj is not None:
+            values["kcal"] = round(kj / 4.184)
+    return values
+
+
+def _off_quantity_text(product: dict) -> str | None:
+    quantity = product.get("quantity")
+    text = _clean(quantity, 60) if isinstance(quantity, str) else ""
+    if text:
+        return text
+    amount = _number(product.get("product_quantity"))
+    unit = _clean(product.get("product_quantity_unit"), 10) or "g"
+    return f"{_compact(amount)} {unit}" if amount is not None and amount > 0 else None
 
 
 def _metric_weight(text: object) -> tuple[float, bool] | None:
@@ -104,23 +134,30 @@ class FoodSources:
         self._transport = transport
         self._usda_key = usda_key
 
-    async def _get_json(self, url: str, params: dict | None = None) -> object:
+    async def _get_bytes(self, url: str, params: dict | None = None, limit: int = MAX_BYTES,
+                         missing_ok: bool = True) -> bytes | None:
         async with httpx2.AsyncClient(
             transport=self._transport, timeout=TIMEOUT, follow_redirects=False, headers={"User-Agent": USER_AGENT}
         ) as http:
             try:
                 async with http.stream("GET", url, params=params) as response:
-                    if response.status_code == 404:  # Open Food Facts : produit inconnu
+                    if response.status_code == 404 and missing_ok:  # Open Food Facts : produit inconnu
                         return None
                     if response.status_code != 200:
                         raise SourceError(f"réponse {response.status_code}")
                     body = b""
                     async for chunk in response.aiter_bytes():
                         body += chunk
-                        if len(body) > MAX_BYTES:
+                        if len(body) > limit:
                             raise SourceError("réponse trop volumineuse")
             except httpx2.HTTPError:
                 raise SourceError("source injoignable") from None
+        return body
+
+    async def _get_json(self, url: str, params: dict | None = None) -> object:
+        body = await self._get_bytes(url, params)
+        if body is None:
+            return None
         try:
             return json.loads(body)
         except ValueError:
@@ -137,16 +174,7 @@ class FoodSources:
         product = data.get("product") if isinstance(data, dict) and data.get("status") == 1 else None
         if not isinstance(product, dict):
             return None
-        nutriments = product.get("nutriments") if isinstance(product.get("nutriments"), dict) else {}
-        values = {}
-        for key, field in _OFF_FIELDS.items():
-            number = _number(nutriments.get(field))
-            if number is not None:
-                values[key] = _compact(number)
-        if "kcal" not in values:  # énergie seulement en kJ sur beaucoup de fiches
-            kj = _number(nutriments.get("energy-kj_100g")) or _number(nutriments.get("energy_100g"))
-            if kj is not None:
-                values["kcal"] = round(kj / 4.184)
+        values = _off_values(product)
         if not values:
             return None
         weight = _off_weight(product)
@@ -165,14 +193,33 @@ class FoodSources:
             raise SourceError("code-barres invalide")
         data = await self._get_json(OFF_URL.format(code=code), params={"fields": "quantity,product_quantity,product_quantity_unit"})
         product = data.get("product") if isinstance(data, dict) and data.get("status") == 1 else None
+        return _off_quantity_text(product) if isinstance(product, dict) else None
+
+    async def off_record(self, code: str) -> dict | None:
+        """Fiche Open Food Facts réduite, en une requête : contenance, valeurs pour 100 g, photo, catégories.
+
+        None si le produit est inconnu ; les champs illisibles sont vides, jamais devinés.
+        """
+        if not _BARCODE.fullmatch(code or ""):
+            raise SourceError("code-barres invalide")
+        data = await self._get_json(OFF_URL.format(code=code), params={"fields": OFF_RECORD_FIELDS})
+        product = data.get("product") if isinstance(data, dict) and data.get("status") == 1 else None
         if not isinstance(product, dict):
             return None
-        text = _clean(product.get("quantity"), 60)
-        if text:
-            return text
-        amount = _number(product.get("product_quantity"))
-        unit = _clean(product.get("product_quantity_unit"), 10) or "g"
-        return f"{_compact(amount)} {unit}" if amount is not None and amount > 0 else None
+        image = next((u for u in (product.get("image_front_url"), product.get("image_url")) if valid_image_url(u)), None)
+        tags = product.get("categories_tags")
+        cats = [_clean(t, 80) for t in tags if isinstance(t, str)][:MAX_CATEGORIES] if isinstance(tags, list) else []
+        return {"q": _off_quantity_text(product), "v": _off_values(product), "img": image, "cats": [c for c in cats if c]}
+
+    async def fetch_image(self, url: str) -> tuple[bytes, str]:
+        """Photo d'Open Food Facts : hôte d'images seulement, sans redirection, 1 Mo au plus, JPEG, PNG ou WebP."""
+        if not valid_image_url(url):
+            raise SourceError("adresse d'image refusée")
+        data = await self._get_bytes(url, limit=MAX_IMAGE_BYTES, missing_ok=False)
+        kind = image_kind(data or b"")
+        if kind is None:
+            raise SourceError("ce n'est pas une image JPEG, PNG ou WebP")
+        return data, kind
 
     async def usda(self, code: str) -> dict | None:
         if not self._usda_key:
