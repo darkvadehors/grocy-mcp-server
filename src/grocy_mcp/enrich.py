@@ -15,8 +15,12 @@ from grocy_mcp.packaging import metric_kind, own_conversions
 FIELDS = ("categorie", "nutrition", "photo")
 IMAGE_HOST = "images.openfoodfacts.org"
 MAX_IMAGE_BYTES = 1_000_000
-NUTRI_VALUES = ("nutri_kcal_100g", "nutri_proteines_100g", "nutri_glucides_100g", "nutri_sucres_100g",
-                "nutri_lipides_100g", "nutri_ags_100g", "nutri_fibres_100g", "nutri_sel_100g")
+NUTRI_BY_KEY = {
+    "kcal": "nutri_kcal_100g", "proteines": "nutri_proteines_100g", "glucides": "nutri_glucides_100g",
+    "sucres": "nutri_sucres_100g", "lipides": "nutri_lipides_100g", "ags": "nutri_ags_100g",
+    "fibres": "nutri_fibres_100g", "sel": "nutri_sel_100g",
+}
+NUTRI_VALUES = tuple(NUTRI_BY_KEY.values())
 NUTRI_WEIGHT, NUTRI_NON_FOOD = "nutri_poids_unite_g", "nutri_non_alimentaire"
 TOLERANCE = 0.01
 
@@ -168,5 +172,5 @@ def plan_enrichment(
     return plan
 
 
-__all__ = ["FIELDS", "MAX_IMAGE_BYTES", "Plan", "image_kind", "missing_fields", "pick_group", "plan_enrichment",
+__all__ = ["FIELDS", "MAX_IMAGE_BYTES", "NUTRI_BY_KEY", "NUTRI_WEIGHT", "Plan", "image_kind", "missing_fields", "pick_group", "plan_enrichment",
            "unit_weight", "valid_image_url"]

@@ -77,6 +77,7 @@ class FakeGrocy:
             "nutri_non_alimentaire",
         }
         self.userfield_values: dict[int, dict[str, str]] = {}
+        self.files: dict[str, bytes] = {}  # productpictures : nom → contenu (Grocy 4.7.1 refuse d'écraser un fichier)
         self.lookup_db: dict[str, dict] = {}  # code-barres → proposition du plugin multi-sources
         self.lookups: list[tuple[str, bool]] = []  # (code, add) dans l'ordre des appels
         self.recipes = [{"id": 1, "name": "Crêpes"}]
@@ -145,7 +146,9 @@ class FakeGrocy:
             return httpx2.Response(401)
         path, method = request.url.path, request.method
         body: dict = {}
-        if method in ("POST", "PUT") and not path.endswith("/undo"):
+        if method == "PUT" and path.startswith("/api/files/"):
+            body = {"__raw": request.content, "__type": request.headers.get("content-type")}
+        elif method in ("POST", "PUT") and not path.endswith("/undo"):
             if request.headers.get("content-type") != "application/json":
                 return _err(400, "Bad Content-Type")
             body = json.loads(request.content or b"{}")
@@ -165,6 +168,7 @@ class FakeGrocy:
             (r"/api/userfields/products/(\d+)", "GET", self._get_userfields),
             (r"/api/userfields/products/(\d+)", "PUT", self._put_userfields),
             (r"/api/objects/products/(\d+)", "PUT", self._put_product),
+            (r"/api/files/(\w+)/([^/]+)", "PUT", self._upload_file),
             (r"/api/stock", "GET", self._stock),
             (r"/api/stock/volatile", "GET", self._volatile),
             (r"/api/stock/products/by-barcode/([^/]+)", "GET", self._by_barcode),
@@ -226,6 +230,21 @@ class FakeGrocy:
         if int(product_id) not in self.products:
             return _err(400, "Object not found")
         self.products[int(product_id)].update(body)
+        return httpx2.Response(204)
+
+    def _upload_file(self, user, request, body, group, encoded):
+        """Grocy 4.7.1 : aucune permission exigée, nom en base64, fichier existant jamais écrasé (fopen « xb »)."""
+        import base64
+
+        if group != "productpictures":
+            return _err(400, "Invalid file group")
+        try:
+            name = base64.b64decode(encoded, validate=True).decode()
+        except ValueError:
+            return _err(400, "Invalid filename")
+        if not re.fullmatch(r"[\w.-]+", name) or name in self.files:
+            return _err(400, f"Error while creating file {name}")
+        self.files[name] = body["__raw"]
         return httpx2.Response(204)
 
     # --- données de base (Grocy 4.7.1 : MASTER_DATA_EDIT, noms uniques) ---------------------------

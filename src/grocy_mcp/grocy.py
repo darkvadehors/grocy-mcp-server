@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import enum
 import re
 from dataclasses import dataclass
@@ -93,7 +94,8 @@ class GrocyClient:
         return f"GrocyClient({self._base_url!r}, <clé masquée>)"
 
     async def _request(
-        self, method: str, path: str, *, params: dict | None = None, body: dict | None = None, timeout: float | None = None
+        self, method: str, path: str, *, params: dict | None = None, body: dict | None = None, timeout: float | None = None,
+        content: bytes | None = None,
     ) -> Any:
         if not path.startswith("/api/"):
             raise ValueError("chemin hors de l'API Grocy")
@@ -106,7 +108,12 @@ class GrocyClient:
             headers=headers,
         ) as http:
             try:
-                response = await http.request(method, path, params=params, json=body)
+                if content is not None:  # fichier envoyé tel quel (photo de produit)
+                    response = await http.request(
+                        method, path, params=params, content=content, headers={"Content-Type": "application/octet-stream"}
+                    )
+                else:
+                    response = await http.request(method, path, params=params, json=body)
             except httpx2.HTTPError:
                 raise GrocyUnavailable("Grocy ne répond pas") from None
         status = response.status_code
@@ -187,6 +194,27 @@ class GrocyClient:
         if not isinstance(kcal, int | float) or isinstance(kcal, bool) or not 0 <= kcal <= 1_000_000:
             raise ValueError("énergie invalide")
         await self._request("PUT", f"/api/objects/products/{_int_id(product_id)}", body={"calories": round(float(kcal), 2)})
+
+    # --- enrichissement des fiches (photo, catégorie) ---------------------------------------------
+    _PRODUCT_FIELDS = frozenset({"picture_file_name", "product_group_id"})
+
+    async def upload_product_picture(self, file_name: str, data: bytes) -> str:
+        """Dépose une photo de produit ; Grocy attend le nom en base64 dans le chemin et n'écrase jamais un fichier."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,150}", file_name or ""):
+            raise ValueError("nom de fichier refusé")
+        if not isinstance(data, bytes) or not data:
+            raise ValueError("photo vide")
+        encoded = base64.b64encode(file_name.encode()).decode()
+        if "/" in encoded or "+" in encoded:  # le chemin ne doit contenir ni « / » ni « + »
+            raise ValueError("nom de fichier refusé")
+        await self._request("PUT", f"/api/files/productpictures/{encoded}", content=data)
+        return file_name
+
+    async def set_product_fields(self, product_id: int, fields: dict) -> None:
+        """Photo ou catégorie d'un produit ; aucun autre champ n'est modifiable par ce chemin."""
+        if not fields or not set(fields) <= self._PRODUCT_FIELDS:
+            raise ValueError("champ de produit non autorisé")
+        await self._request("PUT", f"/api/objects/products/{_int_id(product_id)}", body=fields)
 
     # --- lectures --------------------------------------------------------------------------------
     async def products(self) -> list[dict]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import socket
@@ -110,6 +111,25 @@ def _env_path(variable: str, directory: str, name: str) -> Path | None:
     return None
 
 
+MAX_CATEGORY_RULES = 5000
+
+
+def _category_rules(path: Path | None) -> list[list[str]]:
+    """Table ordonnée [[étiquette Open Food Facts, code de catégorie Grocy], …] ; absente : aucune catégorie."""
+    if path is None or not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise SystemExit("table des catégories illisible (JSON attendu)") from None
+    rules = data.get("regles") if isinstance(data, dict) else data
+    if not isinstance(rules, list) or len(rules) > MAX_CATEGORY_RULES or not all(
+        isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) and 0 < len(x) <= 120 for x in r) for r in rules
+    ):
+        raise SystemExit("table des catégories invalide : [[étiquette, code], …] attendu")
+    return rules
+
+
 def _packaging(args: argparse.Namespace) -> int:
     """Passage de conditionnement (timer systemd) avec la clé du compte Grocy dédié auto-ia."""
     import asyncio
@@ -139,11 +159,13 @@ def _packaging(args: argparse.Namespace) -> int:
             raise SystemExit("--ignorer : identifiants de produits séparés par des virgules (ex. 6,12)") from None
         state.ignore(ids)
         print(f"{len(ids)} produit(s) écarté(s) du conditionnement automatique")
+    rules = _category_rules(_env_path("MCP_CATEGORY_MAP", "CREDENTIALS_DIRECTORY", "categories")) if args.enrichir else []
     audit_path = _env_path("MCP_PACKAGING_AUDIT", "LOGS_DIRECTORY", "conditionnement.jsonl")
     audit = AuditLog(audit_path) if audit_path and not args.dry_run else None
     try:
         report = asyncio.run(run_packaging(
-            _make_client(base_url, key), _make_sources(), cache, dry_run=args.dry_run, audit=audit, state=state
+            _make_client(base_url, key), _make_sources(), cache, dry_run=args.dry_run, audit=audit, state=state,
+            enrich=args.enrichir, rules=rules,
         ))
     except GrocyAuthError:
         print("clé auto-ia refusée par Grocy (révoquée ?)", file=sys.stderr)
@@ -163,6 +185,10 @@ def _packaging(args: argparse.Namespace) -> int:
         if line["statut"] != "deja":
             detail = f" — {line['contenance']} ({line['source']})" if line["contenance"] else ""
             print(f"  {line['statut']} : {line['produit']}{detail}")
+        if line.get("enrichi"):
+            print(f"  enrichi : {line['produit']} — {', '.join(line['enrichi'])}")
+        if line.get("enrichissement") == "erreur":
+            print(f"  enrichissement en erreur : {line['produit']}")
     return 0
 
 
@@ -182,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     packaging = commands.add_parser("conditionner", help="conditionnement automatique des produits (compte auto-ia)")
     packaging.add_argument("--dry-run", action="store_true", help="afficher sans rien écrire")
     packaging.add_argument("--ignorer", help="identifiants de produits à ne jamais conditionner (ex. 6,12)")
+    packaging.add_argument("--enrichir", action="store_true",
+                           help="compléter aussi les champs vides : catégorie, apports nutritionnels, photo")
     packaging.set_defaults(handler=_packaging)
     args = parser.parse_args(argv)
     return args.handler(args)

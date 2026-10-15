@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 
@@ -111,3 +112,41 @@ def test_conditionner_requires_key(tmp_path, monkeypatch):
     monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
     with pytest.raises(SystemExit):
         main(["conditionner"])
+
+
+def test_conditionner_enrichir(tmp_path, monkeypatch, capsys):
+    """E7 : l'option --enrichir et la table des catégories (credential « categories » ou MCP_CATEGORY_MAP)."""
+    import httpx2
+
+    import grocy_mcp.__main__ as cli
+    from grocy_mcp.sources import FoodSources
+    from tests.fake_grocy import FakeGrocy
+
+    fake = FakeGrocy()
+    fake.product_groups = [{"id": 28, "name": "06.01 — Riz, pâtes, semoules et céréales"}]
+    _packaging_env(monkeypatch, tmp_path, fake)
+    product = {"status": 1, "product": {"categories_tags": ["en:pastas"]}}
+    monkeypatch.setattr(cli, "_make_sources", lambda: FoodSources(transport=httpx2.MockTransport(
+        lambda r: httpx2.Response(200, json=product))))
+    rules = tmp_path / "categories"
+    rules.write_text(json.dumps({"regles": [["en:pastas", "06.01"]]}))
+    monkeypatch.delenv("MCP_CATEGORY_MAP", raising=False)
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
+    assert main(["conditionner", "--dry-run", "--enrichir"]) == 0
+    assert "product_group_id" not in fake.products[1]
+    assert "enrichi : Lait demi-écrémé — categorie" in capsys.readouterr().out
+    assert main(["conditionner"]) == 0
+    assert "product_group_id" not in fake.products[1]  # sans l'option : rien
+    assert main(["conditionner", "--enrichir"]) == 0
+    assert fake.products[1]["product_group_id"] == 28
+
+
+@pytest.mark.parametrize("content", ["{", '{"regles": "x"}', '{"regles": [["en:a"]]}', '[["en:a", 5]]'])
+def test_conditionner_table_illisible(tmp_path, monkeypatch, content):
+    from tests.fake_grocy import FakeGrocy
+
+    _packaging_env(monkeypatch, tmp_path, FakeGrocy())
+    (tmp_path / "map.json").write_text(content)
+    monkeypatch.setenv("MCP_CATEGORY_MAP", str(tmp_path / "map.json"))
+    with pytest.raises(SystemExit, match="catégories"):
+        main(["conditionner", "--enrichir"])

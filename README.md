@@ -99,7 +99,7 @@ Master key:
 ```bash
 python -m grocy_mcp generate-key /etc/grocy-mcp/mcp-key          # 32 random bytes, file 0600
 python -m grocy_mcp rotate-key /etc/grocy-mcp/mcp-key /etc/grocy-mcp/mcp-key.new
-python -m grocy_mcp conditionner [--dry-run]                       # packaging pass (see below)
+python -m grocy_mcp conditionner [--dry-run] [--enrichir]          # packaging pass (see below)
 ```
 
 ### Automatic packaging
@@ -113,6 +113,15 @@ when a product already has its own conversion; the stock, quantities and names a
 account with the single permission `MASTER_DATA_EDIT`; its API key is read from `$CREDENTIALS_DIRECTORY/auto-key`
 (or `MCP_AUTO_KEY_FILE`), the Open Food Facts cache from `$STATE_DIRECTORY/off-cache.json` (or `MCP_PACKAGING_STATE`)
 and its own audit log goes to `$LOGS_DIRECTORY/conditionnement.jsonl` (or `MCP_PACKAGING_AUDIT`).
+
+With `--enrichir`, the same pass also fills **empty** product fields from the same Open Food Facts request: the product
+group (from an ordered rule table, most specific first: `{"regles": [["en:spring-waters", "01.01"], ["en:waters",
+"01.01"], …]}` read from `$CREDENTIALS_DIRECTORY/categories` or `MCP_CATEGORY_MAP`; a rule targets the group whose name
+is the code or starts with « code »), the nutrition fields and the native energy (only when the weight of one stock
+unit is certain: typed by a person, a metric stock unit, or a product conversion to a metric unit), and the product
+picture (front image from `images.openfoodfacts.org` only, no redirect, 1 MB at most, JPEG, PNG or WebP checked by
+signature). A field is never overwritten, and a field filled by the pass then emptied by a person is never filled
+again (`traites.json`). Non-food products (`nutri_non_alimentaire`) never get nutrition.
 
 ## Typical deployment
 
