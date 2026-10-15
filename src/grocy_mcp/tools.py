@@ -42,6 +42,7 @@ NEVER = "2999-12-31"  # « jamais » dans Grocy
 CONFIRMATION_TTL = 300
 IDEMPOTENCY_TTL = 600
 UNDO_WINDOW = 86_400
+LOCAL_UNDO = ("prix:", "ticket:")  # jetons d'annulation propres à la base du serveur
 _BARCODE = re.compile(r"[0-9]{8,14}")
 _PRODUCT_ID = re.compile(r"#?[0-9]{1,7}")
 _PENDING = "__en_cours__"
@@ -792,9 +793,16 @@ class ToolService:
                 "message": "Aucune action de stock faite via ce connecteur dans les dernières 24 heures n'est à annuler.",
             }
 
-        transactions = last.transaction_id.split()  # un import enregistre plusieurs transactions
+        tokens = last.transaction_id.split()  # un import enregistre plusieurs transactions
+        # Jetons locaux (prix notés, ticket importé) : effacés de la base du serveur une fois Grocy annulé
+        local = [t for t in tokens if t.startswith(LOCAL_UNDO)]
+        transactions = [t for t in tokens if t not in local]
 
         async def run(client: GrocyClient) -> dict:
+            if not transactions:
+                self._undo_local(caller, local)
+                self.store.mark_undone(last.rowid)
+                return {"statut": "ok", "message": f"Action annulée : {last.summary}.", "outil_annule": last.tool}
             pending = []
             for transaction in transactions:
                 rows = await client.transaction(transaction)
@@ -803,6 +811,7 @@ class ToolService:
                 if not all(int(r.get("undone") or 0) for r in rows):
                     pending.append(transaction)
             if not pending:
+                self._undo_local(caller, local)
                 self.store.mark_undone(last.rowid)
                 return {"statut": "deja_annule", "message": f"Cette action était déjà annulée : {last.summary}."}
             failed, reason = [], ""
@@ -819,7 +828,7 @@ class ToolService:
                 note = " Les produits, emplacements et catégories créés par l'import restent dans Grocy."
                 self.store.release_idempotent_prefix(caller.grocy_user_id, "importer_articles:")
             if failed:  # on ne garde que les transactions restantes : un nouvel essai ne vise qu'elles
-                self.store.update_undo(last.rowid, " ".join(reversed(failed)))
+                self.store.update_undo(last.rowid, " ".join([*reversed(failed), *local]))
                 return {
                     "statut": "partiel",
                     "message": f"Annulation partielle : {last.summary}. {len(pending) - len(failed)} achat(s) annulé(s), "
@@ -828,10 +837,19 @@ class ToolService:
                     "non_annulees": len(failed),
                     "outil_annule": last.tool,
                 }
+            self._undo_local(caller, local)
             self.store.mark_undone(last.rowid)
             return {"statut": "ok", "message": f"Action annulée : {last.summary}.{note}", "outil_annule": last.tool}
 
         return await self._execute(caller, "annuler_derniere_action", {"transaction": last.transaction_id}, run)
+
+    def _undo_local(self, caller: Caller, tokens: list[str]) -> None:
+        prices = [int(t.split(":", 1)[1]) for t in tokens if t.startswith("prix:")]
+        if prices:
+            self.store.delete_prices(prices, caller.grocy_user_id)
+        for token in tokens:
+            if token.startswith("ticket:"):
+                self.store.delete_receipt(int(token.split(":", 1)[1]))
 
     # --- données de base : création seulement (aucun outil ne modifie ni ne supprime) -----------------
     @staticmethod
