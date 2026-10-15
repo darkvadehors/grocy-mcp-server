@@ -12,6 +12,7 @@ import re
 import unicodedata
 
 from grocy_mcp.enrich import unit_weight
+from grocy_mcp.packaging import metric_kind
 
 MAX_STORES = 10  # magasins essayés pour la répartition (les plus fournis en prix)
 RISE = 0.10
@@ -106,6 +107,8 @@ def stock_amount(line: dict, product: dict, units: dict[int, str], conversions: 
     quantity = float(line.get("quantite") or 1)
     stock = int(product["qu_id_stock"])
     purchase = int(product.get("qu_id_purchase") or stock)
+    if metric_kind(units.get(purchase, "")) is not None:  # vendu au poids ou au volume : sans poids, rien de deviné
+        return None
     if purchase == stock:
         return quantity
     factor = _factor(conversions, int(product["id"]), purchase, stock)

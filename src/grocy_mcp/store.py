@@ -51,6 +51,9 @@ CREATE INDEX IF NOT EXISTS prices_product ON prices(product_id);
 CREATE TABLE IF NOT EXISTS receipt_labels(
     location_id INTEGER NOT NULL, label TEXT NOT NULL, product_id INTEGER NOT NULL, product_created TEXT,
     updated_at REAL NOT NULL, PRIMARY KEY(location_id, label));
+CREATE TABLE IF NOT EXISTS receipt_label_changes(
+    receipt_id INTEGER NOT NULL, location_id INTEGER NOT NULL, label TEXT NOT NULL, prev_product INTEGER,
+    prev_created TEXT, PRIMARY KEY(receipt_id, location_id, label));
 CREATE TABLE IF NOT EXISTS receipts(
     id INTEGER PRIMARY KEY AUTOINCREMENT, location_id INTEGER NOT NULL, day TEXT NOT NULL, total_cents INTEGER NOT NULL,
     created_at REAL NOT NULL, UNIQUE(location_id, day, total_cents));
@@ -450,7 +453,19 @@ class Store:
             return None
         return int(row[0]) if created is None or row[1] is None or row[1] == created else None
 
-    def save_label(self, location_id: int, label: str, product_id: int, created: str | None = None) -> None:
+    def save_label(
+        self, location_id: int, label: str, product_id: int, created: str | None = None, receipt_id: int | None = None
+    ) -> None:
+        """Associe un libellé à un produit ; avec receipt_id, l'association d'avant est gardée pour l'annulation."""
+        if receipt_id is not None:
+            previous = self._one(
+                "SELECT product_id, product_created FROM receipt_labels WHERE location_id = ? AND label = ?", (location_id, label)
+            )
+            self._exec(
+                "INSERT OR IGNORE INTO receipt_label_changes(receipt_id, location_id, label, prev_product, prev_created) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (receipt_id, location_id, label, previous[0] if previous else None, previous[1] if previous else None),
+            )
         self._exec(
             "INSERT INTO receipt_labels(location_id, label, product_id, product_created, updated_at) VALUES(?, ?, ?, ?, ?) "
             "ON CONFLICT(location_id, label) DO UPDATE SET product_id = excluded.product_id, "
@@ -472,6 +487,18 @@ class Store:
         return int(cursor.lastrowid) if cursor.rowcount else None
 
     def delete_receipt(self, receipt_id: int) -> None:
+        """Oublie un ticket (annulation) et remet les associations de libellés d'avant ce ticket."""
+        with self._lock:
+            changes = self._db.execute(
+                "SELECT location_id, label, prev_product, prev_created FROM receipt_label_changes WHERE receipt_id = ?",
+                (receipt_id,),
+            ).fetchall()
+        for location_id, label, prev_product, prev_created in changes:
+            if prev_product is None:
+                self._exec("DELETE FROM receipt_labels WHERE location_id = ? AND label = ?", (location_id, label))
+            else:
+                self.save_label(location_id, label, prev_product, prev_created)
+        self._exec("DELETE FROM receipt_label_changes WHERE receipt_id = ?", (receipt_id,))
         self._exec("DELETE FROM receipts WHERE id = ?", (receipt_id,))
 
     # --- maintenance ----------------------------------------------------------------------------

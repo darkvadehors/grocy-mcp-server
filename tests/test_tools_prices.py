@@ -154,6 +154,14 @@ def writes(fake):
     return [(m, p) for m, p in fake.calls if m in ("POST", "PUT")]
 
 
+async def confirm(prices, token, choix=None):
+    """Confirmation complète : un choix de produit donne d'abord un second aperçu chiffré, confirmé ensuite tel quel."""
+    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=token, choix=choix)
+    if result["statut"] == "apercu":
+        result = await prices.importer_ticket(JOHNNY, jeton_confirmation=result["jeton_confirmation"])
+    return result
+
+
 async def preview(prices, caller=JOHNNY, **extra):
     data = ticket(**extra)
     return await prices.importer_ticket(caller, data["magasin"], data["date"], data["total"], data["lignes"])
@@ -174,7 +182,7 @@ async def test_ticket_preview_writes_nothing(prices, fake, store):
 
 async def test_ticket_confirm_buys_with_unit_price_and_remembers(prices, fake, store):
     first = await preview(prices)
-    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=first["jeton_confirmation"], choix={"1": 5, "2": 4})
+    result = await confirm(prices, first["jeton_confirmation"], {"1": 5, "2": 4})
     assert result["statut"] == "ok"
     done = {line["ligne"]: line for line in result["lignes"]}
     assert done[1]["resultat"] == "ajoute" and done[2]["resultat"] == "ajoute" and done[4]["resultat"] == "ignore"
@@ -190,7 +198,7 @@ async def test_ticket_confirm_buys_with_unit_price_and_remembers(prices, fake, s
 async def test_ticket_undo_restores_stock_and_allows_reimport(prices, fake):
     before = fake.amount(5)
     first = await preview(prices)
-    await prices.importer_ticket(JOHNNY, jeton_confirmation=first["jeton_confirmation"], choix={"1": 5, "2": "ignorer"})
+    await confirm(prices, first["jeton_confirmation"], {"1": 5, "2": "ignorer"})
     assert fake.amount(5) == before + 1
     assert (await prices.annuler_derniere_action(JOHNNY))["statut"] == "ok"
     assert fake.amount(5) == before
@@ -202,10 +210,13 @@ async def test_ticket_completes_a_scanned_entry_without_price(prices, fake):
     scanned["purchased_date"] = "2026-10-13"
     data = await preview(prices, lignes=[{"libelle": "PATES", "prix": 3.0, "quantite": 2}], total=3.0)
     assert data["lignes"][0]["action"] is None  # pas encore associé : l'action sera décidée à la confirmation
-    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
-    assert result["lignes"][0]["resultat"] == "complete"
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    line = second["lignes"][0]
+    assert line["action"] == "completer" and line["a_completer"] == 1 and line["non_rapproche"] == 1
+    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=second["jeton_confirmation"])
+    assert result["lignes"][0]["resultat"] == "complete" and result["lignes"][0]["non_rapproche"] == 1
     assert (scanned["price"], scanned["shopping_location_id"]) == (1.5, 2)
-    assert fake.amount(5) == 2  # entrée scannée (1, complétée) + reste du ticket (1, acheté)
+    assert fake.amount(5) == 1  # le reste n'est jamais acheté en silence (l'autre paquet a pu être consommé)
     assert ("PUT", f"/api/stock/entry/{scanned['id']}") in fake.calls
     assert (await prices.annuler_derniere_action(JOHNNY))["statut"] == "ok"
     restored = next(e for e in fake.entries if e["id"] == scanned["id"])
@@ -223,13 +234,12 @@ def fake_date(days):
 async def test_ticket_price_only_and_unknown_unit(prices, fake, store):
     data = await preview(prices, lignes=[{"libelle": "PATES", "prix": 2.0}, {"libelle": "LAIT VRAC", "prix": 3.0,
                                                                              "poids_kg": 1.5}], total=5.0)
-    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"],
-                                          choix={"1": 5, "2": 1})
+    result = await confirm(prices, data["jeton_confirmation"], {"1": 5, "2": 1})
     done = {line["ligne"]: line for line in result["lignes"]}
     assert done[2]["resultat"] == "ignore" and "unité" in done[2]["raison"]  # pièce sans contenance : rien d'inventé
     data = await preview(prices, date="2026-10-13", lignes=[{"libelle": "PATES", "prix": 2.0}], total=2.0)
     before = fake.amount(5)
-    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": "prix_seulement"})
+    result = await confirm(prices, data["jeton_confirmation"], {"1": "prix_seulement"})
     assert result["lignes"][0]["resultat"] == "prix_note" and fake.amount(5) == before
     assert [(r["prix"], r["source"], r["date"]) for r in store.prices_for([5]) if r["source"] == "ticket"] == [(2.0, "ticket", "2026-10-13")]
 
@@ -268,7 +278,7 @@ async def test_ticket_badly_read_is_refused(prices, fake, field, value, match):
 async def test_ticket_new_store_created_only_on_confirmation(prices, fake):
     data = await preview(prices, magasin="Grand Frais Laon")
     assert data["magasin"] == {"nom": "Grand Frais Laon", "nouveau": True} and writes(fake) == []
-    await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    await confirm(prices, data["jeton_confirmation"], {"1": 5})
     assert fake.shopping_locations[-1]["name"] == "Grand Frais Laon"
 
 
@@ -283,8 +293,8 @@ async def test_ticket_token_is_single_use_and_personal(prices):
 
 async def test_ticket_two_previews_import_once(prices):
     first, second = await preview(prices), await preview(prices)
-    assert (await prices.importer_ticket(JOHNNY, jeton_confirmation=first["jeton_confirmation"], choix={"1": 5}))["statut"] == "ok"
-    again = await prices.importer_ticket(JOHNNY, jeton_confirmation=second["jeton_confirmation"], choix={"1": 5})
+    assert (await confirm(prices, first["jeton_confirmation"], {"1": 5}))["statut"] == "ok"
+    again = await confirm(prices, second["jeton_confirmation"], {"1": 5})
     assert again["statut"] == "deja_importe"
 
 
@@ -292,7 +302,7 @@ async def test_ticket_two_previews_import_once(prices):
 async def test_ticket_bad_choices(prices, fake, choix):
     data = await preview(prices)
     if choix == {"1": 99999}:  # produit inexistant : ligne ignorée, rien d'autre
-        result = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix=choix)
+        result = await confirm(prices, data["jeton_confirmation"], choix)
         assert result["lignes"][0]["resultat"] == "ignore" and writes(fake) == []
         return
     with pytest.raises(ToolFailure, match="choix"):
@@ -313,7 +323,7 @@ async def test_ticket_grocy_down_midway_then_undo(prices, fake):
         return original(user, request, body, product_id, action)
 
     fake._stock_action = flaky
-    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5, "2": 4})
+    result = await confirm(prices, data["jeton_confirmation"], {"1": 5, "2": 4})
     fake._stock_action = original
     done = {line["ligne"]: line for line in result["lignes"]}
     assert done[1]["resultat"] == "ajoute" and done[2]["resultat"] == "incertain"
@@ -332,7 +342,7 @@ async def test_ticket_hostile_label_is_only_data(prices):
 async def test_ticket_memory_ignores_a_reused_product_number(prices, fake, store):
     fake.products[5]["row_created_timestamp"] = "2026-10-01 10:00:00"
     first = await preview(prices)
-    await prices.importer_ticket(JOHNNY, jeton_confirmation=first["jeton_confirmation"], choix={"1": 5})
+    await confirm(prices, first["jeton_confirmation"], {"1": 5})
     # la personne supprime « Pâtes » ; l'app recrée un autre produit sous le même numéro
     fake.products[5] = {**fake.products[5], "name": "Papier toilette", "row_created_timestamp": "2026-10-15 08:00:00"}
     again = await preview(prices, date="2026-10-15", total=1.0, lignes=[{"libelle": "PATES PENNE", "prix": 1.0}])
@@ -414,3 +424,133 @@ async def test_depenses_uses_completed_price(prices, fake):
 async def test_depenses_bad_input(prices, args, match):
     with pytest.raises(ToolFailure, match=match):
         await prices.depenses(JOHNNY, **args)
+
+
+
+# --- revue finale : constats corrigés ---------------------------------------------------------------
+async def test_ticket_new_product_choice_shows_a_priced_preview_first(prices, fake):
+    data = await preview(prices)
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5, "2": 4})
+    assert second["statut"] == "apercu" and writes(fake) == []
+    lines = {line["ligne"]: line for line in second["lignes"]}
+    assert lines[1]["action"] == "ajouter" and lines[1]["prix_unite_stock"] == 1.0 and lines[2]["quantite_stock"] == 2
+    result = await prices.importer_ticket(JOHNNY, jeton_confirmation=second["jeton_confirmation"])
+    assert result["statut"] == "ok" and result["magasin_cree"] is False
+
+
+async def test_ticket_metric_product_without_weight_is_not_guessed(prices, fake):
+    fake.quantity_units.append({"id": 3, "name": "Gramme", "name_plural": "Grammes"})
+    fake.products[5].update(qu_id_stock=3, qu_id_purchase=3)
+    data = await preview(prices, lignes=[{"libelle": "PATES VRAC", "prix": 2.15}], total=2.15)
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    assert second["lignes"][0]["action"] == "ignorer" and "poids" in second["lignes"][0]["raison"]
+    with pytest.raises(ToolFailure, match="poids"):
+        await prices.noter_prix(JOHNNY, "Pâtes", "Leclerc", 2.15)
+    ok = await prices.noter_prix(JOHNNY, "Pâtes", "Leclerc", 2.15, poids_kg=0.5)
+    assert ok["prix_normalise"] == {"valeur": 4.3, "unite": "kg"}
+
+
+async def test_ticket_implausible_unit_price_is_flagged(prices, fake):
+    grams(fake, 5, 1)  # 1 pièce = 1 g : contenance mal saisie
+    data = await preview(prices, lignes=[{"libelle": "PATES", "prix": 2.0}], total=2.0)
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    assert second["lignes"][0]["a_verifier"] is True and any("ligne 1" in w for w in second["avertissements"])
+
+
+async def test_ticket_new_store_reported_as_created(prices, fake):
+    data = await preview(prices, magasin="Grand Frais")
+    result = await confirm(prices, data["jeton_confirmation"], {"1": 5})
+    assert result["magasin_cree"] is True
+
+
+async def test_ticket_partial_line_is_reported_and_undoable(prices, fake):
+    first = fake.add_entry(5, 1, fake_date(30), 2)
+    other = fake.add_entry(5, 1, fake_date(30), 2)
+    first["purchased_date"] = other["purchased_date"] = "2026-10-14"
+    original = fake._edit_entry
+
+    def refuse_second(user, request, body, entry_id):
+        if int(entry_id) == first["id"]:  # la plus récente (id le plus grand : « other ») passe d'abord
+            return __import__("httpx2").Response(400, json={"error_message": "refus simulé"})
+        return original(user, request, body, entry_id)
+
+    fake._edit_entry = refuse_second
+    data = await preview(prices, lignes=[{"libelle": "PATES", "prix": 2.0, "quantite": 2}], total=2.0)
+    result = await confirm(prices, data["jeton_confirmation"], {"1": 5})
+    fake._edit_entry = original
+    assert result["lignes"][0]["resultat"] == "partiel" and result["statut"] == "ok"
+    assert "annuler_derniere_action" in result["message"]
+    assert (await prices.annuler_derniere_action(JOHNNY))["statut"] == "ok"
+    assert all(e["price"] is None for e in fake.entries)
+
+
+async def test_ticket_undo_restores_label_memory(prices, store):
+    first = await preview(prices)
+    await confirm(prices, first["jeton_confirmation"], {"1": 5})
+    second = await preview(prices, date="2026-10-15", total=1.0, lignes=[{"libelle": "PATES PENNE", "prix": 1.0}])
+    await confirm(prices, second["jeton_confirmation"], {"1": 4})  # erreur de la personne
+    assert store.label_product(2, "pates penne") == 4
+    await prices.annuler_derniere_action(JOHNNY)
+    assert store.label_product(2, "pates penne") == 5  # association d'avant le ticket annulé
+    await prices.annuler_derniere_action(JOHNNY)  # rien à annuler (une seule action annulable)
+    third = await preview(prices, date="2026-10-13", total=1.0, lignes=[{"libelle": "NOUVEAU LIBELLE", "prix": 1.0}])
+    await confirm(prices, third["jeton_confirmation"], {"1": 5})
+    await prices.annuler_derniere_action(JOHNNY)
+    assert store.label_product(2, "nouveau libelle") is None
+
+
+async def test_ticket_quota_checked_before_the_token_is_used(prices, store, clock):
+    data = await preview(prices)
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    for _ in range(30):
+        store.record_action(JOHNNY.grocy_user_id)
+    with pytest.raises(ToolFailure, match="Limite"):
+        await prices.importer_ticket(JOHNNY, jeton_confirmation=second["jeton_confirmation"])
+    clock.advance(61)
+    assert (await prices.importer_ticket(JOHNNY, jeton_confirmation=second["jeton_confirmation"]))["statut"] == "ok"
+
+
+async def test_ticket_large_ticket_costs_more_quota(prices, store):
+    lines = [{"libelle": f"ARTICLE {i}", "prix": 1.0} for i in range(100)]
+    data = await preview(prices, lignes=lines, total=100.0)
+    await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"])
+    assert store.count_actions(JOHNNY.grocy_user_id, 0) == 10
+
+
+async def test_ticket_free_item_and_zero_prices(prices, store):
+    data = await preview(prices, lignes=[{"libelle": "PATES", "prix": 1.0}, {"libelle": "OFFERT", "prix": -1.0}], total=0)
+    second = await prices.importer_ticket(JOHNNY, jeton_confirmation=data["jeton_confirmation"], choix={"1": 5})
+    assert second["lignes"][0]["action"] == "ignorer" and "gratuit" in second["lignes"][0]["raison"]
+    store.add_price(4, product_id=5, location_id=3, price=0, day="2026-10-10", source="rayon")
+    assert (await prices.comparer_prix(JOHNNY, "Pâtes"))["magasins"] == []
+
+
+async def test_ticket_uncertain_line_says_it_is_not_undone(prices, fake):
+    data = await preview(prices)
+    original = fake._stock_action
+
+    def lost(user, request, body, product_id, action):
+        raise __import__("httpx2").ReadTimeout("perdu", request=request)
+
+    fake._stock_action = lost
+    result = await confirm(prices, data["jeton_confirmation"], {"1": 5})
+    fake._stock_action = original
+    assert result["lignes"][0]["resultat"] == "incertain" and "Grocy" in result["lignes"][0]["raison"]
+    assert "vérifiez" in result["message"]
+
+
+async def test_ticket_forgotten_product_is_not_shown_as_memory(prices, fake, store):
+    store.save_label(2, "sac cabas", 999)
+    data = await preview(prices, lignes=[{"libelle": "SAC CABAS", "prix": 0.1}], total=0.1)
+    assert data["lignes"][0]["origine"] == "inconnu"
+
+
+async def test_repartir_courses_other_list_and_overflow(prices, basket, store, monkeypatch):
+    from grocy_mcp import price_tools
+
+    basket.shopping.append({"id": 9, "product_id": 3, "amount": 1.0, "note": None, "shopping_list_id": 2, "done": 0})
+    store.add_price(4, product_id=3, location_id=2, price=1.0, day="2026-10-10", source="rayon")
+    assert (await prices.repartir_courses(JOHNNY, liste=2))["par_magasin"][0]["articles"][0]["produit"] == "Yaourt fraise"
+    monkeypatch.setattr(price_tools, "SPLIT_MAX_ITEMS", 1)
+    result = await prices.repartir_courses(JOHNNY)
+    assert {"Beurre doux", "Lait demi-écrémé"} <= set(result["sans_prix"])

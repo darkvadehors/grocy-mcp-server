@@ -298,7 +298,9 @@ async def test_prix_de_bout_en_bout(http, fake):
     error, preview = await tool(http, access, "importer_ticket", magasin="Leclerc", date=today, total=1.5,
                                 lignes=[{"libelle": "PATES", "prix": 1.5}])
     assert not error and preview["statut"] == "apercu", preview
-    error, done = await tool(http, access, "importer_ticket", jeton_confirmation=preview["jeton_confirmation"], choix={"1": 5})
+    error, priced = await tool(http, access, "importer_ticket", jeton_confirmation=preview["jeton_confirmation"], choix={"1": 5})
+    assert not error and priced["statut"] == "apercu" and priced["lignes"][0]["prix_unite_stock"] == 1.5, priced
+    error, done = await tool(http, access, "importer_ticket", jeton_confirmation=priced["jeton_confirmation"])
     assert not error and done["statut"] == "ok", done
     error, compared = await tool(http, access, "comparer_prix", produit="pâtes")
     assert not error and compared["magasins"][0]["magasin"] == "Leclerc"
