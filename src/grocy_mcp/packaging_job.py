@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -20,6 +21,7 @@ from grocy_mcp.sources import FoodSources, SourceError
 
 _NO_RECORD = object()
 OFF_TTL = 7 * 86400  # C7 : Open Food Facts interrogé au plus une fois par code-barres et par 7 jours
+LOOKUP_PAUSE = 1.0  # secondes entre deux requêtes Open Food Facts d'un passage (débit limité, réponses 429)
 MAX_LOOKUPS_PER_PASS = 30  # au-delà, les produits sont reportés au passage suivant (revue M1)
 # Réponse d'Open Food Facts illisible ou piégée : traitée comme une panne, jamais fatale au passage (revue I2)
 _OFF_FAILURES = (SourceError, ValueError, TypeError, OverflowError, RecursionError, AttributeError, KeyError)
@@ -325,6 +327,8 @@ async def run_packaging(
                 if lookups >= MAX_LOOKUPS_PER_PASS:
                     lines.append({"produit": name, "statut": "reporte", "source": None, "contenance": None})
                     continue
+                if lookups and LOOKUP_PAUSE:
+                    await asyncio.sleep(LOOKUP_PAUSE)
                 lookups += 1
                 if enrich_lookup:
                     try:

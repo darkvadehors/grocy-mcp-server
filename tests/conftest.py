@@ -80,3 +80,11 @@ def service(settings, store, box, audit, fake):
     return ToolService(
         settings, store, box, audit, lambda key: GrocyClient(settings.grocy_base_url, key, transport=fake.transport())
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_lookup_pause(monkeypatch):
+    """Pas de pause entre requêtes Open Food Facts dans les tests (vérifiée dans test_enrich_job)."""
+    from grocy_mcp import packaging_job
+
+    monkeypatch.setattr(packaging_job, "LOOKUP_PAUSE", 0)

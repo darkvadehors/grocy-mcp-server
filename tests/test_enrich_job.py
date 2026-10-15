@@ -212,3 +212,16 @@ async def test_same_product_keeps_its_memory(grocy, sources, tmp_path):
     grocy.products[1]["product_group_id"] = None
     await run(grocy, sources, tmp_path)
     assert grocy.products[1]["product_group_id"] is None
+
+
+async def test_pause_between_open_food_facts_requests(grocy, sources, tmp_path, monkeypatch):
+    """Open Food Facts limite le débit (429) : une pause entre deux requêtes du passage, jamais avant la première."""
+    pauses = []
+
+    async def fake_sleep(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(packaging_job, "LOOKUP_PAUSE", 1.0)
+    monkeypatch.setattr(packaging_job.asyncio, "sleep", fake_sleep)
+    await run(grocy, sources, tmp_path)
+    assert pauses == [1.0, 1.0, 1.0]  # 4 codes, 4 requêtes
