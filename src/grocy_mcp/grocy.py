@@ -139,7 +139,9 @@ class GrocyClient:
         await self._request("GET", "/api/users")
 
     # --- données de base (permission Grocy MASTER_DATA_EDIT) -------------------------------------
-    _CREATABLE = frozenset({"products", "product_barcodes", "locations", "product_groups", "quantity_unit_conversions"})
+    _CREATABLE = frozenset(
+        {"products", "product_barcodes", "locations", "product_groups", "quantity_unit_conversions", "shopping_locations"}
+    )
 
     async def external_lookup(self, code: str, add: bool = False) -> dict | None:
         """Recherche du plugin multi-sources ; add=True crée le produit et son code-barres dans Grocy."""
@@ -248,6 +250,14 @@ class GrocyClient:
     async def shopping_list(self) -> list[dict]:
         return await self._request("GET", "/api/objects/shopping_list")
 
+    async def shopping_locations(self) -> list[dict]:
+        """Magasins (« Lieux d'achat » de Grocy)."""
+        return await self._request("GET", "/api/objects/shopping_locations")
+
+    async def stock_log(self) -> list[dict]:
+        """Journal du stock (lecture seule) : achats et modifications, avec prix par unité de stock."""
+        return await self._request("GET", "/api/objects/stock_log")
+
     async def locations(self) -> list[dict]:
         return await self._request("GET", "/api/objects/locations")
 
@@ -291,7 +301,10 @@ class GrocyClient:
         price: float | None = None,
         best_before_date: str | None = None,
         location_id: int | None = None,
+        purchased_date: str | None = None,
+        shopping_location_id: int | None = None,
     ) -> list[dict]:
+        """Achat ; price = prix par unité de stock (Grocy 4.7.1)."""
         body: dict = {"amount": amount, "transaction_type": "purchase"}
         if price is not None:
             body["price"] = price
@@ -299,7 +312,21 @@ class GrocyClient:
             body["best_before_date"] = best_before_date
         if location_id is not None:
             body["location_id"] = _int_id(location_id)
+        if purchased_date is not None:
+            body["purchased_date"] = purchased_date
+        if shopping_location_id is not None:
+            body["shopping_location_id"] = _int_id(shopping_location_id)
         return await self._request("POST", f"/api/stock/products/{_int_id(product_id)}/add", body=body)
+
+    _ENTRY_FIELDS = frozenset(
+        {"amount", "best_before_date", "location_id", "shopping_location_id", "price", "open", "purchased_date"}
+    )
+
+    async def edit_stock_entry(self, entry_id: int, body: dict) -> list[dict]:
+        """Modifie une entrée de stock (Grocy exige amount, open et purchased_date : renvoyer les valeurs actuelles)."""
+        if not set(body) <= self._ENTRY_FIELDS or not {"amount", "open", "purchased_date"} <= set(body):
+            raise ValueError("champs d'entrée de stock refusés")
+        return await self._request("PUT", f"/api/stock/entry/{_int_id(entry_id)}", body=body)
 
     async def consume(self, product_id: int, amount: float, spoiled: bool = False) -> list[dict]:
         body = {"amount": amount, "spoiled": spoiled}

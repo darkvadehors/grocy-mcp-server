@@ -179,3 +179,31 @@ def test_rekey(store):
     assert n == 2
     assert store.get_account(3).enc_key == b"new3grocy-user:3"
     assert store.get_pending("p").enc_key == b"newppending:p"
+
+
+def test_prices_shared_and_deleted_only_by_owner(store, clock):
+    first = store.add_price(3, product_id=1, location_id=2, price=1.5, day="2026-10-01", source="rayon")
+    second = store.add_price(4, product_id=1, location_id=3, price=1.4, day="2026-10-02", source="ticket")
+    store.add_price(3, product_id=2, location_id=2, price=9, day="2026-10-02", source="rayon")
+    rows = store.prices_for([1])
+    assert [(r["location_id"], r["prix"], r["date"], r["source"]) for r in rows] == [(2, 1.5, "2026-10-01", "rayon"), (3, 1.4, "2026-10-02", "ticket")]
+    assert len(store.prices_for(None)) == 3
+    assert store.delete_prices([first, second], 3) == 1  # le prix noté par un autre compte reste
+    assert [r["location_id"] for r in store.prices_for([1])] == [3]
+
+
+def test_receipt_labels(store, clock):
+    assert store.label_product(2, "beurre doux") is None
+    store.save_label(2, "beurre doux", 4)
+    store.save_label(2, "beurre doux", 5)  # dernière association confirmée
+    assert store.label_product(2, "beurre doux") == 5
+    assert store.label_product(3, "beurre doux") is None  # propre au magasin
+
+
+def test_receipts_reserved_once(store):
+    assert store.receipt_exists(2, "2026-10-14", 4210) is False
+    rid = store.reserve_receipt(2, "2026-10-14", 4210)
+    assert rid is not None and store.receipt_exists(2, "2026-10-14", 4210)
+    assert store.reserve_receipt(2, "2026-10-14", 4210) is None
+    store.delete_receipt(rid)
+    assert store.reserve_receipt(2, "2026-10-14", 4210) is not None

@@ -9,6 +9,7 @@ import json
 import math
 import re
 import unicodedata
+from datetime import date
 
 import httpx2
 
@@ -20,6 +21,9 @@ _BARCODE = re.compile(r"[0-9]{8,14}")
 _MULTIPACK = re.compile(r"\d\s*[x×*]\s*\d", re.I)
 _NAME_WEIGHT = re.compile(r"\d+(?:[.,]\d+)?\s*(?:kg|gr|g)\b", re.I)
 OFF_URL = "https://world.openfoodfacts.org/api/v2/product/{code}.json"
+OPEN_PRICES_URL = "https://prices.openfoodfacts.org/api/v1/prices"
+OPEN_PRICES_PAGE = 30
+OPEN_PRICES_MAX_AGE = 365
 USDA_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 OFF_RECORD_FIELDS = (
     "quantity,product_quantity,product_quantity_unit,nutriments,image_front_url,image_url,categories_tags"
@@ -233,6 +237,38 @@ class FoodSources:
         if kind is None:
             raise ImageRejected("ce n'est pas une image JPEG, PNG ou WebP")
         return data, kind
+
+    async def open_prices(self, code: str, today: str, limit: int = 5) -> list[dict]:
+        """Prix récents relevés en France sur Open Prices (lecture seule, sans identifiant personnel), du plus récent.
+
+        Seuls les prix en euros, d'un magasin situé en France, de moins d'un an et pour le produit entier sont gardés.
+        """
+        if not _BARCODE.fullmatch(code or ""):
+            raise SourceError("code-barres invalide")
+        data = await self._get_json(
+            OPEN_PRICES_URL, params={"product_code": code, "order_by": "-date", "size": OPEN_PRICES_PAGE}
+        )
+        items = data.get("items") if isinstance(data, dict) else None
+        found: list[dict] = []
+        now = date.fromisoformat(today)
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict) or item.get("currency") != "EUR" or item.get("price_per") not in (None, "UNIT"):
+                continue
+            location = item.get("location") if isinstance(item.get("location"), dict) else {}
+            if location.get("osm_address_country_code") != "FR":
+                continue
+            price = _number(item.get("price"))
+            try:
+                day = date.fromisoformat(str(item.get("date") or ""))
+            except ValueError:
+                continue
+            if price is None or not 0 < price <= 1000 or not 0 <= (now - day).days <= OPEN_PRICES_MAX_AGE:
+                continue
+            found.append({"prix": _compact(price), "date": day.isoformat(), "magasin": _clean(location.get("osm_name"), 60),
+                          "ville": _clean(location.get("osm_address_city"), 60)})
+            if len(found) >= limit:
+                break
+        return found
 
     async def usda(self, code: str) -> dict | None:
         if not self._usda_key:

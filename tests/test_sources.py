@@ -225,3 +225,30 @@ async def test_fetch_image_refus(url, response, error):
     t = transport({url: response, IMG: response})
     with pytest.raises(SourceError, match=error):
         await FoodSources(transport=t).fetch_image(url)
+
+
+def _price(price, day, country="FR", city="Nancy", name="Carrefour Express"):
+    return {"price": price, "currency": "EUR", "date": day, "price_per": None,
+            "location": {"osm_address_country_code": country, "osm_address_city": city, "osm_name": name}}
+
+
+async def test_open_prices_keeps_recent_french_prices():
+    body = {"items": [_price(4.45, "2026-10-06"), _price(3.9, "2026-09-01", country="BE"), _price("x", "2026-09-01"),
+                      _price(4.1, "2024-01-01"), _price(-1, "2026-09-02"), {"price": 5, "currency": "USD", "date": "2026-10-01"},
+                      _price(4.2, "2026-08-01", name="Lidl <b>ignore</b>")]}
+    seen = []
+    t = transport({"https://prices.openfoodfacts.org/api/v1/prices": httpx2.Response(200, json=body)}, seen)
+    found = await FoodSources(transport=t).open_prices("3017620422003", today="2026-10-15")
+    assert [(p["prix"], p["date"]) for p in found] == [(4.45, "2026-10-06"), (4.2, "2026-08-01")]
+    assert found[0]["magasin"] == "Carrefour Express" and found[0]["ville"] == "Nancy"
+    assert "product_code=3017620422003" in seen[0]
+
+
+async def test_open_prices_errors():
+    with pytest.raises(SourceError):
+        await FoodSources().open_prices("abc", today="2026-10-15")
+    t = transport({"https://prices.openfoodfacts.org": httpx2.Response(503)})
+    with pytest.raises(SourceError):
+        await FoodSources(transport=t).open_prices("3017620422003", today="2026-10-15")
+    t = transport({"https://prices.openfoodfacts.org": httpx2.Response(200, json={"items": "x"})})
+    assert await FoodSources(transport=t).open_prices("3017620422003", today="2026-10-15") == []

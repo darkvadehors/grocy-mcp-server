@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS undo(
 CREATE TABLE IF NOT EXISTS confirmations(
     hash TEXT PRIMARY KEY, grocy_user_id INTEGER NOT NULL, tool TEXT NOT NULL, payload TEXT NOT NULL,
     expires_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS prices(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, grocy_user_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+    location_id INTEGER NOT NULL, price REAL NOT NULL, day TEXT NOT NULL, source TEXT NOT NULL, created_at REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS prices_product ON prices(product_id);
+CREATE TABLE IF NOT EXISTS receipt_labels(
+    location_id INTEGER NOT NULL, label TEXT NOT NULL, product_id INTEGER NOT NULL, updated_at REAL NOT NULL,
+    PRIMARY KEY(location_id, label));
+CREATE TABLE IF NOT EXISTS receipts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, location_id INTEGER NOT NULL, day TEXT NOT NULL, total_cents INTEGER NOT NULL,
+    created_at REAL NOT NULL, UNIQUE(location_id, day, total_cents));
 """
 
 PENDING_TTL = 600.0
@@ -397,6 +407,58 @@ class Store:
                 (conf_hash, grocy_user_id, tool, self.now()),
             ).fetchone()
         return row[0] if row else None
+
+    # --- prix des courses (spec prix P6) : partagés par le foyer, supprimés seulement par leur auteur ---------
+    def add_price(self, grocy_user_id: int, *, product_id: int, location_id: int, price: float, day: str, source: str) -> int:
+        cursor = self._exec(
+            "INSERT INTO prices(grocy_user_id, product_id, location_id, price, day, source, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (grocy_user_id, product_id, location_id, price, day, source, self.now()),
+        )
+        return int(cursor.lastrowid)
+
+    def delete_prices(self, ids: list[int], grocy_user_id: int) -> int:
+        count = 0
+        for price_id in ids:
+            count += self._exec("DELETE FROM prices WHERE id = ? AND grocy_user_id = ?", (price_id, grocy_user_id)).rowcount
+        return count
+
+    def prices_for(self, product_ids: list[int] | None) -> list[dict]:
+        sql = "SELECT id, product_id, location_id, price, day, source FROM prices"
+        params: tuple = ()
+        if product_ids is not None:
+            sql += f" WHERE product_id IN ({','.join('?' * len(product_ids))})" if product_ids else " WHERE 0"
+            params = tuple(product_ids)
+        with self._lock:
+            rows = self._db.execute(sql + " ORDER BY day, id", params).fetchall()
+        return [{"id": r[0], "product_id": r[1], "location_id": r[2], "prix": r[3], "date": r[4], "source": r[5]} for r in rows]
+
+    def label_product(self, location_id: int, label: str) -> int | None:
+        row = self._one("SELECT product_id FROM receipt_labels WHERE location_id = ? AND label = ?", (location_id, label))
+        return int(row[0]) if row else None
+
+    def save_label(self, location_id: int, label: str, product_id: int) -> None:
+        self._exec(
+            "INSERT INTO receipt_labels(location_id, label, product_id, updated_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(location_id, label) DO UPDATE SET product_id = excluded.product_id, updated_at = excluded.updated_at",
+            (location_id, label, product_id, self.now()),
+        )
+
+    def receipt_exists(self, location_id: int, day: str, total_cents: int) -> bool:
+        return self._one(
+            "SELECT 1 FROM receipts WHERE location_id = ? AND day = ? AND total_cents = ?", (location_id, day, total_cents)
+        ) is not None
+
+    def reserve_receipt(self, location_id: int, day: str, total_cents: int) -> int | None:
+        """Réserve un ticket (magasin, date, total) ; None s'il a déjà été importé."""
+        cursor = self._exec(
+            "INSERT OR IGNORE INTO receipts(location_id, day, total_cents, created_at) VALUES(?, ?, ?, ?)",
+            (location_id, day, total_cents, self.now()),
+        )
+        return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def delete_receipt(self, receipt_id: int) -> None:
+        self._exec("DELETE FROM receipts WHERE id = ?", (receipt_id,))
 
     # --- maintenance ----------------------------------------------------------------------------
     def purge_expired(self) -> None:

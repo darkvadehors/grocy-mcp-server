@@ -173,3 +173,34 @@ async def test_calories_seul_champ_modifiable(fake):
     assert [m for m, p in fake.paths() if p == "/api/objects/products/1"] == ["PUT"]
     with pytest.raises(ValueError):
         await c.set_product_calories(1, -5)
+
+
+async def test_purchase_with_store_and_date(fake):
+    c = client(fake)
+    rows = await c.purchase(1, 2, price=1.25, purchased_date="2026-10-12", shopping_location_id=2)
+    entry = fake.entries[-1]
+    assert (entry["price"], entry["purchased_date"], entry["shopping_location_id"]) == (1.25, "2026-10-12", 2)
+    assert rows[0]["transaction_type"] == "purchase"
+
+
+async def test_edit_stock_entry_and_undo(fake):
+    c = client(fake)
+    entry = fake.entries[0]
+    rows = await c.edit_stock_entry(entry["id"], {**{k: entry[k] for k in ("amount", "best_before_date", "location_id",
+                                                                           "purchased_date")}, "open": 0, "price": 0.99,
+                                                   "shopping_location_id": 2})
+    assert {r["transaction_type"] for r in rows} == {"stock-edit-old", "stock-edit-new"}
+    assert (entry["price"], entry["shopping_location_id"]) == (0.99, 2)
+    await c.undo(rows[0]["transaction_id"])
+    assert fake.entries[0]["price"] is None
+
+
+async def test_shopping_locations_and_stock_log(fake):
+    c = client(fake)
+    assert [s["name"] for s in await c.shopping_locations()] == ["Leclerc", "Intermarché"]
+    new_id = await c.create_object("shopping_locations", {"name": "Grand Frais"})
+    assert any(s["id"] == new_id for s in await c.shopping_locations())
+    await c.purchase(1, 1, price=2.0, shopping_location_id=2)
+    assert [r["price"] for r in await c.stock_log() if r["transaction_type"] == "purchase"] == [2.0]
+    history = await c.price_history(1)
+    assert history[0]["price"] == 2.0 and history[0]["shopping_location"]["id"] == 2

@@ -64,6 +64,7 @@ class FakeGrocy:
         }
         self.barcodes = {"3017620422003": 1}
         self.locations = [{"id": 1, "name": "Frigo"}, {"id": 2, "name": "Placard"}]
+        self.shopping_locations = [{"id": 2, "name": "Leclerc"}, {"id": 3, "name": "Intermarché"}]
         self.quantity_units = [{"id": 1, "name": "Pièce", "name_plural": "Pièces"}]
         self.product_groups: list[dict] = []
         self.conversions: list[dict] = []  # quantity_unit_conversions (product_id None : conversion générale)
@@ -108,6 +109,7 @@ class FakeGrocy:
 
     def add_entry(self, product_id: int, amount: float, best_before: date, location_id: int) -> dict:
         entry = {
+            "id": next(self._ids),
             "stock_id": f"s{next(self._ids)}",
             "product_id": product_id,
             "amount": float(amount),
@@ -115,6 +117,9 @@ class FakeGrocy:
             "best_before_date": best_before.isoformat(),
             "location_id": location_id,
             "price": None,
+            "open": 0,
+            "purchased_date": TODAY.isoformat(),
+            "shopping_location_id": None,
         }
         self.entries.append(entry)
         return entry
@@ -162,8 +167,9 @@ class FakeGrocy:
         return [
             (r"/api/user", "GET", self._user),
             (r"/api/users", "GET", self._users),
-            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups|stock|product_barcodes|quantity_unit_conversions)", "GET", self._objects),
-            (r"/api/objects/(products|product_barcodes|locations|product_groups|quantity_unit_conversions)", "POST", self._create_object),
+            (r"/api/objects/(products|shopping_list|locations|quantity_units|recipes|product_groups|stock|product_barcodes|quantity_unit_conversions|shopping_locations|stock_log)", "GET", self._objects),
+            (r"/api/objects/(products|product_barcodes|locations|product_groups|quantity_unit_conversions|shopping_locations)", "POST", self._create_object),
+            (r"/api/stock/entry/(\d+)", "PUT", self._edit_entry),
             (r"/api/stock/barcodes/external-lookup/([^/]+)", "GET", self._external_lookup),
             (r"/api/userfields/products/(\d+)", "GET", self._get_userfields),
             (r"/api/userfields/products/(\d+)", "PUT", self._put_userfields),
@@ -203,6 +209,8 @@ class FakeGrocy:
             "stock": [{**e, "amount": str(e["amount"])} for e in self.entries],  # Grocy : montants en texte
             "product_barcodes": [{"product_id": pid, "barcode": code} for code, pid in self.barcodes.items()],
             "quantity_unit_conversions": self.conversions,
+            "shopping_locations": self.shopping_locations,
+            "stock_log": self.log,
         }[entity]
         return httpx2.Response(200, json=data)
 
@@ -275,7 +283,8 @@ class FakeGrocy:
                 return None, _err(400, "product_id does not reference an existing product")
             self.barcodes[str(data["barcode"])] = int(data["product_id"])
             return int(data["product_id"]), None
-        table = {"products": list(self.products.values()), "locations": self.locations, "product_groups": self.product_groups}[entity]
+        table = {"products": list(self.products.values()), "locations": self.locations, "product_groups": self.product_groups,
+                 "shopping_locations": self.shopping_locations}[entity]
         name = data.get("name")
         if not name:
             return None, _err(400, f"NOT NULL constraint failed: {entity}.name")
@@ -394,8 +403,53 @@ class FakeGrocy:
         return httpx2.Response(200, json=[e for e in self.entries if e["product_id"] == int(product_id)])
 
     def _price_history(self, user, request, body, product_id):
+        """Comme la vue products_price_history : achat non modifié, ou dernière modification ; prix > 0."""
         _, error = self._product_or_error(int(product_id))
-        return error or httpx2.Response(200, json=[])
+        if error:
+            return error
+        live = [r for r in self.log if r["product_id"] == int(product_id) and not r["undone"]]
+        edited = {r["stock_id"] for r in live if r["transaction_type"] == "stock-edit-new"}
+        newest: dict[str, dict] = {}
+        for r in live:
+            if r["transaction_type"] == "stock-edit-new":
+                newest[r["stock_id"]] = r
+            elif r["transaction_type"] == "purchase" and r["stock_id"] not in edited:
+                newest[r["stock_id"]] = r
+        shops = {s["id"]: s for s in self.shopping_locations}
+        rows = [
+            {"date": r.get("purchased_date"), "price": r["price"], "shopping_location": shops.get(r.get("shopping_location_id"))}
+            for r in newest.values()
+            if (r.get("price") or 0) > 0
+        ]
+        return httpx2.Response(200, json=sorted(rows, key=lambda r: r["date"] or "", reverse=True))
+
+    def _edit_entry(self, user, request, body, entry_id):
+        """Grocy 4.7.1 : STOCK_EDIT ; amount, open et purchased_date obligatoires ; deux lignes stock-edit-old/new."""
+        if not user.can("STOCK_EDIT"):
+            return _err(403, "Permission missing: STOCK_EDIT")
+        entry = next((e for e in self.entries if e["id"] == int(entry_id)), None)
+        if entry is None:
+            return _err(400, "Stock does not exist")
+        if "amount" not in body:
+            return _err(400, "An amount is required")
+        if "open" not in body or "purchased_date" not in body:
+            return _err(500, "Undefined array key")
+        before = copy.deepcopy(self.entries)
+        tx = f"tx{next(self._tx)}"
+        base = {"transaction_id": tx, "product_id": entry["product_id"], "stock_id": entry["stock_id"], "undone": 0,
+                "user_id": user.id}
+        old = {**base, "id": next(self._ids), "transaction_type": "stock-edit-old", "amount": -entry["amount"],
+               "price": entry["price"], "purchased_date": entry["purchased_date"],
+               "shopping_location_id": entry["shopping_location_id"]}
+        entry.update({k: body.get(k) for k in ("amount", "best_before_date", "location_id", "shopping_location_id",
+                                               "price", "open", "purchased_date")})
+        entry["amount"] = float(entry["amount"])
+        new = {**base, "id": next(self._ids), "transaction_type": "stock-edit-new", "amount": entry["amount"],
+               "price": entry["price"], "purchased_date": entry["purchased_date"],
+               "shopping_location_id": entry["shopping_location_id"]}
+        self.log.extend([old, new])
+        self._snapshots[tx] = (before, copy.deepcopy(self.entries), {entry["product_id"]})
+        return httpx2.Response(200, json=[old, new])
 
     def _fulfillment(self, *_):
         return httpx2.Response(200, json=self.fulfillment)
@@ -464,7 +518,11 @@ class FakeGrocy:
                     pid, amount, date.fromisoformat(bbd), body.get("location_id") or self.products[pid]["location_id"]
                 )
                 entry["price"] = body.get("price")
+                entry["purchased_date"] = body.get("purchased_date") or TODAY.isoformat()
+                entry["shopping_location_id"] = body.get("shopping_location_id")
                 log(amount, "purchase", entry["stock_id"])
+                rows[-1].update(price=entry["price"], purchased_date=entry["purchased_date"],
+                                shopping_location_id=entry["shopping_location_id"])
             elif action == "consume":
                 if amount > self.amount(pid):
                     return _err(400, "Amount to be consumed cannot be > current stock amount")
