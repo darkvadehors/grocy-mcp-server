@@ -118,7 +118,7 @@ class FakeGrocy:
             "location_id": location_id,
             "price": None,
             "open": 0,
-            "purchased_date": TODAY.isoformat(),
+            "purchased_date": (TODAY - timedelta(days=30)).isoformat(),  # stock déjà là depuis un mois
             "shopping_location_id": None,
         }
         self.entries.append(entry)

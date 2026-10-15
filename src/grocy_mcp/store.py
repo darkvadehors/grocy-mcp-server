@@ -49,8 +49,8 @@ CREATE TABLE IF NOT EXISTS prices(
     location_id INTEGER NOT NULL, price REAL NOT NULL, day TEXT NOT NULL, source TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS prices_product ON prices(product_id);
 CREATE TABLE IF NOT EXISTS receipt_labels(
-    location_id INTEGER NOT NULL, label TEXT NOT NULL, product_id INTEGER NOT NULL, updated_at REAL NOT NULL,
-    PRIMARY KEY(location_id, label));
+    location_id INTEGER NOT NULL, label TEXT NOT NULL, product_id INTEGER NOT NULL, product_created TEXT,
+    updated_at REAL NOT NULL, PRIMARY KEY(location_id, label));
 CREATE TABLE IF NOT EXISTS receipts(
     id INTEGER PRIMARY KEY AUTOINCREMENT, location_id INTEGER NOT NULL, day TEXT NOT NULL, total_cents INTEGER NOT NULL,
     created_at REAL NOT NULL, UNIQUE(location_id, day, total_cents));
@@ -399,6 +399,14 @@ class Store:
             (conf_hash, grocy_user_id, tool, payload_json, expires_at),
         )
 
+    def peek_confirmation(self, token: str, grocy_user_id: int, tool: str) -> str | None:
+        """Contenu d'un jeton encore valable, sans le consommer (contrôle des choix avant confirmation)."""
+        row = self._one(
+            "SELECT payload FROM confirmations WHERE hash = ? AND grocy_user_id = ? AND tool = ? AND expires_at > ?",
+            (sha256_hex(token), grocy_user_id, tool, self.now()),
+        )
+        return row[0] if row else None
+
     def pop_confirmation(self, conf_hash: str, grocy_user_id: int, tool: str) -> str | None:
         with self._lock:
             row = self._db.execute(
@@ -433,15 +441,21 @@ class Store:
             rows = self._db.execute(sql + " ORDER BY day, id", params).fetchall()
         return [{"id": r[0], "product_id": r[1], "location_id": r[2], "prix": r[3], "date": r[4], "source": r[5]} for r in rows]
 
-    def label_product(self, location_id: int, label: str) -> int | None:
-        row = self._one("SELECT product_id FROM receipt_labels WHERE location_id = ? AND label = ?", (location_id, label))
-        return int(row[0]) if row else None
+    def label_product(self, location_id: int, label: str, created: str | None = None) -> int | None:
+        """Produit associé à ce libellé dans ce magasin ; ignoré si le numéro désigne un produit recréé depuis."""
+        row = self._one(
+            "SELECT product_id, product_created FROM receipt_labels WHERE location_id = ? AND label = ?", (location_id, label)
+        )
+        if row is None:
+            return None
+        return int(row[0]) if created is None or row[1] is None or row[1] == created else None
 
-    def save_label(self, location_id: int, label: str, product_id: int) -> None:
+    def save_label(self, location_id: int, label: str, product_id: int, created: str | None = None) -> None:
         self._exec(
-            "INSERT INTO receipt_labels(location_id, label, product_id, updated_at) VALUES(?, ?, ?, ?) "
-            "ON CONFLICT(location_id, label) DO UPDATE SET product_id = excluded.product_id, updated_at = excluded.updated_at",
-            (location_id, label, product_id, self.now()),
+            "INSERT INTO receipt_labels(location_id, label, product_id, product_created, updated_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(location_id, label) DO UPDATE SET product_id = excluded.product_id, "
+            "product_created = excluded.product_created, updated_at = excluded.updated_at",
+            (location_id, label, product_id, created, self.now()),
         )
 
     def receipt_exists(self, location_id: int, day: str, total_cents: int) -> bool:
