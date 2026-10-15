@@ -22,7 +22,8 @@ TOOLS = {
     "recettes_faisables", "voir_references", "ajouter_liste_courses", "retirer_liste_courses",
     "ajouter_manquants_liste", "enregistrer_achat", "consommer", "ouvrir", "deplacer",
     "corriger_inventaire", "annuler_derniere_action", "importer_articles", "creer_emplacement", "creer_categorie", "voir_nutrition", "completer_nutrition", "definir_nutrition", "autonomie_alimentaire", "rechercher_ciqual",
-    "voir_conditionnements_manquants", "definir_conditionnement"}
+    "voir_conditionnements_manquants", "definir_conditionnement",
+    "importer_ticket", "noter_prix", "comparer_prix", "repartir_courses", "depenses"}
 SECRETS: list[str] = []
 
 
@@ -253,7 +254,7 @@ async def test_import_de_bout_en_bout(http, fake):
     _, tokens, _, _ = await login(http)
     access = tokens["access_token"]
     listing = (await rpc(http, access, "tools/list")).json()["result"]["tools"]
-    assert len(listing) == 26
+    assert len(listing) == 31
     importer = next(t for t in listing if t["name"] == "importer_articles")
     assert "FoodShiner" in importer["description"] and importer["annotations"]["destructiveHint"] is False
     fake.lookup_db["5449000000996"] = {"name": "Coca-Cola 33 cl"}
@@ -280,3 +281,30 @@ async def test_nutrition_de_bout_en_bout(http, fake):
     assert not error and out["statut"] == "ok" and fake.products[5]["calories"] == 725
     error, out = await tool(http, access, "autonomie_alimentaire")
     assert not error and out["statut"] == "foyer_non_configure"
+
+
+async def test_prix_de_bout_en_bout(http, fake):
+    """Ticket via MCP : aperçu, choix (clés en texte comme les envoie l'assistant), confirmation, comparaison."""
+    _, tokens, _, _ = await login(http)
+    access = tokens["access_token"]
+    listing = {t["name"]: t for t in (await rpc(http, access, "tools/list")).json()["result"]["tools"]}
+    assert listing["comparer_prix"]["annotations"]["readOnlyHint"] is True
+    assert listing["depenses"]["annotations"]["readOnlyHint"] is True
+    assert listing["importer_ticket"]["annotations"]["destructiveHint"] is False
+    assert "photo" in listing["importer_ticket"]["description"]
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).date().isoformat()  # fuseau du serveur de test : UTC
+    error, preview = await tool(http, access, "importer_ticket", magasin="Leclerc", date=today, total=1.5,
+                                lignes=[{"libelle": "PATES", "prix": 1.5}])
+    assert not error and preview["statut"] == "apercu", preview
+    error, done = await tool(http, access, "importer_ticket", jeton_confirmation=preview["jeton_confirmation"], choix={"1": 5})
+    assert not error and done["statut"] == "ok", done
+    error, compared = await tool(http, access, "comparer_prix", produit="pâtes")
+    assert not error and compared["magasins"][0]["magasin"] == "Leclerc"
+    error, out = await tool(http, access, "noter_prix", produit="pâtes", magasin="Intermarché", prix=1.2)
+    assert not error and out["statut"] == "ok"
+    error, out = await tool(http, access, "repartir_courses")
+    assert not error and out["statut"] == "ok"
+    error, out = await tool(http, access, "depenses", derniers_mois=1)
+    assert not error and out["total"] == 1.5

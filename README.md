@@ -46,7 +46,12 @@ Built on the official MCP Python SDK (`mcp==2.3.0`): the same process is both th
 | `autonomie_alimentaire` | How many days the household can live on the current stock (energy, proteins), computed by the server | read |
 | `voir_conditionnements_manquants` | Products whose packaging (1 piece = 250 g, 1 pack = 6 bottles) is not set yet, and why | read |
 | `definir_conditionnement` | Sets a product's packaging: 1 `par` = `quantite` `unite` (creates a product-specific unit conversion, never replaces one) | write |
-| `annuler_derniere_action` | Undo the last action made through this server | action |
+| `importer_ticket` | Record the prices of a photographed receipt in two steps: preview (line → product, from the store's memory or suggestions; discounts, total check, duplicates refused), then confirmation with per-line choices; a scanned item without price is completed, otherwise a purchase is added at the price per stock unit | action |
+| `noter_prix` | Remember a shelf price without buying (stock unchanged); creates the store if needed | action |
+| `comparer_prix` | Latest price of a product in each store, per kg, litre or unit, cheapest first; Open Prices (elsewhere in France) as a fallback | read |
+| `repartir_courses` | Cheapest combination of 1 to 3 stores for the shopping list, with the saving against the best single store | read |
+| `depenses` | Spending per month and per store, and price rises over 10 % | read |
+| `annuler_derniere_action` | Undo the last action made through this server (including a whole receipt or a noted price) | action |
 
 Tool names and messages are in French.
 
